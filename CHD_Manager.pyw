@@ -34,7 +34,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.2.1"
+APP_VER = "1.2.2"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -364,6 +364,7 @@ echo Could not replace the program. The new version was saved as: %NEW%
 pause
 exit /b 1
 :swapped
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
 start "" "%OLD%"
 (goto) 2>nul & del "%~f0"
 """
@@ -430,6 +431,16 @@ def stage_app_update(info, dest_dir, progress=None):
         return new
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def spawn_swap(script):
+    """Run the swap script detached. The environment is cleaned first: a PyInstaller exe that is relaunched from
+    inside itself inherits its parent's bookkeeping variables and, when the new exe has the same path as the old
+    one, tries to reuse the old run's temp folder, which no longer exists ('Failed to load Python DLL')."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(["cmd", "/c", str(script)], creationflags=CREATE_NO_WINDOW | 0x00000008, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, env=env)
 
 
 def write_swap_script(new_exe, old_exe):
@@ -1931,8 +1942,7 @@ class App:
         self.app_swap_script = script
         if self.silent:
             return
-        subprocess.Popen(["cmd", "/c", script], creationflags=CREATE_NO_WINDOW | 0x00000008, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+        spawn_swap(script)
         self.save_settings()
         self.root.destroy()
 
@@ -2189,6 +2199,9 @@ def smoke_test(outfile):
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--relaunch-test":
+        spawn_swap(write_swap_script(Path(sys.argv[2]), Path(sys.argv[3])))
+        return
     if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
         SETTINGS_FILE_OVERRIDE = Path(sys.argv[2]).with_suffix(".settings.json")
         globals()["SETTINGS_FILE"] = SETTINGS_FILE_OVERRIDE      # don't touch the real settings during the check
