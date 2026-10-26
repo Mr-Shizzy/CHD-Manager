@@ -34,7 +34,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.2.0"
+APP_VER = "1.2.1"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -42,6 +42,7 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 CD_MAX_BYTES = 737_280_000          # 80-minute CD: 360,000 sectors * 2048 bytes
 SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin"}
+UNSUPPORTED_EXTS = {".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".pbp", ".zip", ".7z", ".rar"}
 CHDMAN = None                        # path to chdman.exe, set at startup
 
 THEMES = {
@@ -230,13 +231,38 @@ def parse_toc(p):
 
 
 # ----------------------------------------------------------- disc sniffing (platform)
+def cue_data_start(p):
+    """(file, byte offset) of the first non-audio track in a .cue, so discs that begin with audio tracks
+    (common for Dreamcast self-boot discs) can still be recognized."""
+    sizes = {"MODE1/2352": 2352, "MODE2/2352": 2352, "MODE1/2048": 2048, "MODE2/2336": 2336}
+    cur_file, cur_type = None, None
+    try:
+        for line in p.read_text("utf-8", "replace").splitlines():
+            t = line.strip()
+            m = re.match(r'FILE\s+(?:"([^"]+)"|(\S+))', t, re.I)
+            if m:
+                cur_file = p.parent / (m.group(1) or m.group(2))
+                continue
+            m = re.match(r"TRACK\s+\d+\s+(\S+)", t, re.I)
+            if m:
+                cur_type = m.group(1).upper()
+                continue
+            m = re.match(r"INDEX\s+01\s+(\d+):(\d+):(\d+)", t, re.I)
+            if m and cur_file and cur_type and cur_type != "AUDIO":
+                frames = (int(m.group(1)) * 60 + int(m.group(2))) * 75 + int(m.group(3))
+                return cur_file, frames * sizes.get(cur_type, 2352)
+    except OSError:
+        pass
+    return None
+
+
 class DiscReader:
-    def __init__(self, path, sector_size, data_offset):
-        self.path, self.ss, self.off = path, sector_size, data_offset
+    def __init__(self, path, sector_size, data_offset, base=0):
+        self.path, self.ss, self.off, self.base = path, sector_size, data_offset, base
 
     def sector(self, lba):
         with open(self.path, "rb") as f:
-            f.seek(lba * self.ss + self.off)
+            f.seek(self.base + lba * self.ss + self.off)
             return f.read(2048)
 
 
@@ -269,11 +295,13 @@ def _iso_platform(r, pvd):
     return None
 
 
-def sniff_platform(path):
+def sniff_platform(path, base=0):
     try:
         for ss, off in ((2048, 0), (2352, 16), (2352, 24)):
-            r = DiscReader(path, ss, off)
+            r = DiscReader(path, ss, off, base)
             s0, s16 = r.sector(0), r.sector(16)
+            if s0.startswith(b"SEGA SEGAKATANA"):
+                return "Dreamcast"
             if len(s16) >= 6 and s16[1:6] == b"CD001":
                 plat = _iso_platform(r, s16)
                 if plat:
@@ -456,13 +484,14 @@ def build_suggestions(jobs, out_hint=None):
 
     rows = [
         ("Compression", "Default",
-         "chdman's default tries several codecs per block and keeps the best one, and it's what emulators expect. "
-         "'Smallest' (LZMA only) is slower and can't beat that by much, since LZMA is already one of the options."),
+         "chdman's default tries several codecs per block and keeps the best one. In tests on 40+ real discs, LZMA-only "
+         "came out 0.5% larger, zlib ('Fast') about 8% larger, and zstd about 4% larger and up to 3x slower."),
         ("Hunk size", "Default",
-         "chdman picks 19,584 bytes for CD images and 4,096 bytes for DVD images. Larger hunks can shave a little "
-         "size, but I haven't verified every emulator accepts them - stay on default unless you've tested."),
-        ("Threads", shown_t, why_t + (" Expect long conversions on a PC this size - that's normal; leave it running."
-                                      if weak else "")),
+         "chdman picks 19,584 bytes for CD images and 4,096 bytes for DVD images. In tests, doubling the hunk saved "
+         "0.6-10% (about 5% on average, least on big images), and doubled hunks booted in DuckStation and Flycast, "
+         "but I haven't tried every emulator, so stay on default unless you've tested yours."),
+        ("Threads", shown_t, why_t + " In testing, speed stopped improving at around 16 threads." + (
+            " Expect long conversions on a PC this size - that's normal; leave it running." if weak else "")),
         ("Low priority", "On" if potato else "Off",
          ("This looks like a modest PC (" + f"{cores} threads" + (f", {ram:.0f} GB RAM" if ram else "") + "), so chdman runs "
           "below your other programs and the PC stays usable. It still uses all free CPU time when you're idle.")
@@ -488,7 +517,8 @@ def build_suggestions(jobs, out_hint=None):
                          "but it's worth leaving on for a batch this size.")
     plats = {j.platform for j in conv if j.platform}
     if any(j.platform == "PS2" and j.type == "DVD" for j in conv):
-        notes.append("PS2 DVD images are written with 'createdvd', which is what PCSX2 expects.")
+        notes.append("Big PS2 ISOs become DVD-type CHDs ('createdvd'). Many PS2 CHDs you find online are CD-type instead. "
+                     "Both are valid CHDs, and both booted in a PCSX2 nightly test, but check one game boots before converting a collection.")
     if any(j.platform == "PSP" for j in conv):
         notes.append("PSP images are treated as DVD-type CHDs.")
     if "Dreamcast" in plats:
@@ -556,6 +586,9 @@ class Job:
         first = next((r for r in refs if r.exists()), None)
         if ext == ".gdi":
             self.platform = "Dreamcast"
+        elif ext == ".cue" and cue_data_start(p) and cue_data_start(p)[0].exists():
+            f0, base = cue_data_start(p)
+            self.platform = sniff_platform(f0, base) or (sniff_platform(first) if first else "")
         elif first:
             self.platform = sniff_platform(first)
         self.auto_type, self.reason = decide_type(ext, data_size, self.platform)
@@ -818,7 +851,7 @@ class App:
             row=7, column=0, columnspan=2, sticky="w")
         ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
                   text="Tip: 'Fast' uses zlib only, the safest pick if an emulator rejects a CHD "
-                       "(NetherSX2/AetherSX2 are reported to need zlib).").grid(
+                       "(NetherSX2/AetherSX2 are reported to need zlib). 'None' makes full-size files, and chdman can't verify an uncompressed CHD.").grid(
             row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(f, text="Verify each CHD after creating it", variable=v["verify_after"]).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -1242,12 +1275,18 @@ class App:
                     e = f.suffix.lower()
                     refs = parse_cue(f) if e == ".cue" else parse_gdi(f) if e == ".gdi" else parse_toc(f) if e == ".toc" else []
                     referenced.update(str(r).lower() for r in refs)
+                ignored = {}
                 for f in sorted(allf):
                     e = f.suffix.lower()
                     if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso"):
                         found.append((f, p))
                     elif e == ".bin" and str(f).lower() not in referenced:
                         found.append((f, p))
+                    elif e in UNSUPPORTED_EXTS:
+                        ignored[e] = ignored.get(e, 0) + 1
+                if ignored:
+                    self.log(f"Ignored {sum(ignored.values())} file(s) chdman can't read directly ({', '.join(sorted(ignored))}). "
+                             "Convert .cdi/.nrg/.mds/.ccd images to .cue or .gdi first, and unpack archives.", "warn")
             elif p.suffix.lower() in SRC_EXTS | {".chd"}:
                 found.append((p, None))
             else:
@@ -1580,16 +1619,20 @@ class App:
                     pass
             return
         job.out_size = out.stat().st_size
+        unverified = False
         if o["verify_after"] or o["delete_src"]:
             self.post("log", "Verifying…", "info")
             vrc, ok = self.verify_file(out, job, "Verifying")
-            if not ok:
+            if ok is False:
                 job.status = "Verify failed"
                 self.post("log", f"VERIFY FAILED for {out.name} - source files were NOT touched.", "err")
                 return
+            unverified = ok is None
         job.status = "Done"
         self.post("log", f"OK  {out.name}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
-        if o["delete_src"]:
+        if o["delete_src"] and unverified:
+            self.post("log", "Source files were kept: an uncompressed CHD can't be verified, so nothing was recycled.", "warn")
+        elif o["delete_src"]:
             if recycle(job.src_files):
                 self.post("log", f"Sent {len(job.src_files)} source file(s) to the Recycle Bin.", "ok")
             else:
@@ -1599,6 +1642,9 @@ class App:
         lines = []
         rc = self.run_proc([CHDMAN, "verify", "-i", str(path)], job, label, capture=lines)
         text = "\n".join(lines).lower()
+        if "uncompressed" in text and "no verification" in text:
+            self.post("log", "This CHD is uncompressed, so chdman has no checksum to verify it against.", "warn")
+            return rc, None
         ok = rc == 0 and "verification successful" in text and "does not match" not in text
         if ok:
             self.post("log", "Verification successful (SHA-1 matches).", "ok")
@@ -1607,9 +1653,9 @@ class App:
     def do_verify(self, job, o):
         self.post("log", f"\nVerify {job.path.name}", "info")
         _, ok = self.verify_file(job.path, job, "Verifying")
-        job.status = "Done" if ok else "Verify failed"
-        job.result = "SHA-1 OK" if ok else "CORRUPT or unreadable"
-        if not ok:
+        job.status = "Done" if ok is not False else "Verify failed"
+        job.result = "uncompressed: nothing to verify" if ok is None else "SHA-1 OK" if ok else "CORRUPT or unreadable"
+        if ok is False:
             self.post("log", f"{job.path.name} FAILED verification.", "err")
 
     def do_extract(self, job, o):
@@ -1646,6 +1692,7 @@ class App:
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      bufsize=0, creationflags=flags)
         buf, last = b"", -1
+        self.last_msg = self.reason_msg = ""
         while True:
             chunk = self.proc.stdout.read(4096)
             if not chunk:
@@ -1668,16 +1715,21 @@ class App:
                     continue
                 if capture is not None:
                     capture.append(line)
-                if line.startswith(("chdman -", "Output CHD", "Input file", "Compression:", "Hunk size", "Input", "Output")) or "error" in line.lower() \
-                        or "complete" in line.lower() or "ratio" in line.lower() or "verif" in line.lower():
-                    tag = "err" if "error" in line.lower() else "info"
-                    self.post("log", "  " + line, tag)
+                if not line.startswith("chdman - "):
+                    self.last_msg = line
+                    low = line.lower()
+                    bad = any(w in low for w in ("error", "fatal", "not divisible", "cannot", "can't", "failed", "invalid", "unsupported"))
+                    if bad and not low.startswith("fatal error occurred"):
+                        self.reason_msg = line              # the specific reason, not chdman's generic last line
+                    self.post("log", "  " + line, "err" if bad else "info")
         if buf.strip():
             line = buf.decode("utf-8", "replace").strip()
             if capture is not None:
                 capture.append(line)
             self.post("log", "  " + line, "info")
         rc = self.proc.wait()
+        if rc != 0 and not self.stop_flag and (self.reason_msg or self.last_msg):
+            job.result = (self.reason_msg or self.last_msg)[:140]              # the reason, visible in the table
         self.post("progress", 100 if rc == 0 else 0)
         return rc
 

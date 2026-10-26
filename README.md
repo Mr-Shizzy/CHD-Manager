@@ -55,6 +55,8 @@ Windows 10/11, 64-bit. Python is not needed. Settings are saved in `chd_manager_
 
 If a PS2 game on a CD slightly exceeds the size limit, or anything else is detected wrongly, right-click it and force the type.
 
+Many PS2 CHDs you find online are CD-type (made with `createcd`), even for big DVD games. CHD Manager builds DVD-type CHDs for big ISOs. Both are valid CHDs, the DVD-type came out 0.6-2% smaller in testing, and both booted in PCSX2, but check that one game boots before converting a collection.
+
 ## Network use
 
 CHD Manager is offline except for the update checks. Each has its own on/off switch (chdman in the **Output** tab, CHD Manager in the **About** tab):
@@ -81,9 +83,29 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 This installs PyInstaller, downloads the latest official chdman (checking its SHA-256), builds `CHD Manager.exe`, and writes the portable folder and a zip to `dist/`. Use `-ChdmanPath` to supply your own chdman instead.
 
-## Status
+## Testing
 
-Tested on Windows 11. The conversion paths (CD from `.cue`/`.bin`, lone `.bin`, ISO as CD and DVD, extraction back to identical files, verification, corrupted-file detection) were checked against the real chdman using synthetic discs. It has not been tried on large real collections on many machines, so please open an issue if something misbehaves, and keep your originals until you have checked a converted game boots.
+Tested on Windows 11 against **42 real discs**: 6 Dreamcast GD-ROM, 3 Dreamcast CD, 16 PS1 and 17 PS2 (7.3 GB of CHDs, 24 GB uncompressed). The test drove the app's own code (folder scan, detection, suggested settings, convert, extract, verify) with chdman 0.289:
+
+| Check | Result |
+| --- | --- |
+| Verify all 42 existing CHDs | 42 / 42 passed |
+| Extract all 42 (to `.cue`/`.bin` and `.gdi`) | 42 / 42 |
+| Rebuild all 42 with the default settings | 42 / 42 have the **same data SHA-1 as the original CHD**; file sizes within -5.9% to +0.3% (median 0.0%) |
+| Platform label (PS1 / PS2 / Dreamcast) | 42 / 42 |
+| DVD path on two real PS2 ISOs (4.4 GB and 1.4 GB) | built as DVD-type CHDs, verified, extracted back to an ISO with the same SHA-1 as the source |
+| Playback in emulators (boot and intro, not played through) | **PS2** in PCSX2 nightly 2.9.146: a CD-type CHD, a DVD-type CHD of the same game, and a 4.4 GB DVD-type CHD built by CHD Manager all booted (the DVD-type files log a harmless "Failed to parse CHD TOC" line). **PS1** in DuckStation 0.1.12074: one game rebuilt at six settings (default, none, zlib, LZMA, zstd, doubled hunk) all booted identically, and a 32-track CD-audio disc and an English-patched game behaved exactly like the original CHDs. **Dreamcast** in RetroArch with the Flycast core: one GD-ROM rebuilt at the same six settings, a second GD-ROM, and a CD-type self-boot disc that starts with audio tracks all booted. |
+| Many-track discs (32 and 11 tracks), split-bin extract and rebuild | identical data |
+| Corrupted, truncated and non-CHD files | all flagged as failed, nothing crashed |
+| Overwrite / skip / rename, lone `.bin`, "recycle sources after a verified CHD" | behaved as described |
+
+**Compression levels** (7 discs, CD-type, up to 4.4 GB), size relative to the default settings: LZMA-only 100.5%, zlib ("Fast") 108%, zstd 104% and 1.8x slower, doubling the hunk size 95% (0.6% smaller on the big disc, up to 10% on small ones). All of those settings, including zstd, uncompressed and the larger hunk, booted in DuckStation and Flycast. The default is still the right choice for almost everything.
+
+**Threads** (a 286 MB disc): 1 thread 34 s, 4 threads 11 s, 8 threads 5 s, 16 threads 3.9 s, 22 threads 3.8 s. Speed stops improving at around 16. Low-priority mode cost nothing on an idle PC.
+
+**Bugs this testing found, fixed in 1.2.1:** "None" compression plus verify reported a false failure; chdman's real error text was hidden when a job failed; three Dreamcast CD discs that start with audio tracks got no platform label; folders containing `.cdi`/`.pbp` files were skipped silently.
+
+**Not tested:** playing any game through (I only checked that each boots and shows its intro), emulators other than PCSX2, DuckStation and RetroArch/Flycast, other versions of chdman, or other versions of Windows. `.cdi`, `.mds`, `.nrg`, `.ccd` and `.pbp` files aren't supported by chdman, so the app skips them and says so.
 
 ## Credits and license
 
