@@ -1,0 +1,13 @@
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+
+# the bundled chdman is fetched by build.ps1, never committed
+chdman.exe
+chdman_old/
+
+# per-user settings
+chd_manager_settings.json
+*.settings.json
