@@ -14,9 +14,9 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 </details>
 
 <details>
-<summary>About tab and the "update available" badge</summary>
+<summary>About tab</summary>
 
-![CHD Manager, About tab with an update badge in the header](docs/screenshot-about.png)
+![CHD Manager, About tab](docs/screenshot-about.png)
 
 </details>
 
