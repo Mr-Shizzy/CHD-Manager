@@ -14,6 +14,15 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 </details>
 
 <details>
+<summary>Working with CHD files</summary>
+
+![CHD Manager with CHD files in the list and the CHD files choice at the top](docs/screenshot-chd.png)
+
+![The CHD files page of the settings window](docs/screenshot-chd-settings.png)
+
+</details>
+
+<details>
 <summary>Settings window, About page</summary>
 
 ![CHD Manager, settings window on the About page](docs/screenshot-about.png)
@@ -24,10 +33,10 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 
 ## Features
 
-- **Drag and drop** files or folders straight onto the window, or use Add Files / Add Folder. Folders are searched recursively.
+- **Drag and drop** files or folders onto the window, or onto the exe itself (or use *Open with*), or use Add Files / Add Folder. Folders are searched recursively.
 - **Queue** of files or folders. Loose `.bin` files that already belong to a `.cue` are skipped.
 - **CD or DVD, detected automatically.** `.cue`/`.gdi`/`.toc` are CD. An `.iso` is CD if it fits on a CD, DVD if it is larger, and PSP images are DVD. It also looks inside the image to label the platform (PS1, PS2, PSP, Dreamcast, Saturn, Sega CD). Right-click any item to force CD or DVD.
-- **Convert and extract.** `.chd` files are read to see whether they hold a CD, GD-ROM or DVD, then extracted to `.cue`+`.bin`, `.gdi`, or `.iso`. Or just verify them.
+- **You choose what happens to CHD files.** Disc images (`.cue`, `.gdi`, `.iso`, `.toc`) become CHDs. When a CHD is in the list, a **CHD files** choice appears at the top: **Extract** it back to a disc image, **Verify** it, or **Recompress** it with different compression (your original is kept). When extracting you pick the format: **Automatic** (CUE/BIN for CDs, GDI for Dreamcast, ISO for DVDs), **ISO** for data discs, or CUE/BIN with one BIN per track or one single BIN. Automatic reads each CD's track count first: a disc with several tracks (audio plus data) gets one BIN per track, and a one-track disc gets a single BIN, with no setting to remember. Anything that comes out as several files (split CDs, Dreamcast GDI) is put in its own folder named after the disc, so a big batch stays tidy. ISO is only offered when nothing would be lost, so discs with audio, several tracks, or PS1-style audio/video sectors are refused instead of mangled. The Action column always spells out what will happen to each file, you can override a single file by right-clicking it, and a skipped job says why.
 - **Suggested settings.** It looks at your PC and your queue and fills in thread count, compression, and so on, with the reason for each. Weak PCs automatically get low-priority mode so Windows stays usable.
 - **Safety.** Optional verify after creating each CHD. Optional "send sources to the Recycle Bin", and only after the new CHD passed verification, so your source files are never permanently deleted.
 - **Options.** Compression presets or custom codecs, hunk size, threads, skip/overwrite/rename existing files, output folder (with folder structure kept), per-track `.bin` extraction.
@@ -97,7 +106,9 @@ Tested on Windows 11 against **42 real discs**: 6 Dreamcast GD-ROM, 3 Dreamcast 
 | Platform label (PS1 / PS2 / Dreamcast) | 42 / 42 |
 | DVD path on two real PS2 ISOs (4.4 GB and 1.4 GB) | built as DVD-type CHDs, verified, extracted back to an ISO with the same SHA-1 as the source |
 | Playback in emulators (boot and intro, not played through) | **PS2** in PCSX2 nightly 2.9.146: a CD-type CHD, a DVD-type CHD of the same game, and a 4.4 GB DVD-type CHD built by CHD Manager all booted (the DVD-type files log a harmless "Failed to parse CHD TOC" line). **PS1** in DuckStation 0.1.12074: one game rebuilt at six settings (default, none, zlib, LZMA, zstd, doubled hunk) all booted identically, and a 32-track CD-audio disc and an English-patched game behaved exactly like the original CHDs. **Dreamcast** in RetroArch with the Flycast core: one GD-ROM rebuilt at the same six settings, a second GD-ROM, and a CD-type self-boot disc that starts with audio tracks all booted. |
-| Many-track discs (32 and 11 tracks), split-bin extract and rebuild | identical data |
+| Many-track discs (32, 11 and 2 tracks), extracted with Automatic (split per track) and rebuilt | identical data; a one-track disc stays one BIN |
+| CHD to ISO (new in 1.4) | a CD CHD with Mode 2 raw sectors became a valid 2048-byte-per-sector ISO that PCSX2 booted; a MODE1/2048 CD CHD became an ISO byte-identical to an independently verified one; audio, multi-track, PS1-style Form 2 and GD-ROM discs were refused with a reason and left no files |
+| Recompress CHD (new in 1.4) | CD, GD-ROM and DVD CHDs recompressed with the same data checksum; the original is never overwritten |
 | Corrupted, truncated and non-CHD files | all flagged as failed, nothing crashed |
 | Overwrite / skip / rename, lone `.bin`, "recycle sources after a verified CHD" | behaved as described |
 
