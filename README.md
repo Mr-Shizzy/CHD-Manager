@@ -13,6 +13,13 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 
 </details>
 
+<details>
+<summary>About tab and the "update available" badge</summary>
+
+![CHD Manager, About tab with an update badge in the header](docs/screenshot-about.png)
+
+</details>
+
 ## Features
 
 - **Drag and drop** files or folders straight onto the window, or use Add Files / Add Folder. Folders are searched recursively.
