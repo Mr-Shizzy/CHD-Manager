@@ -14,9 +14,11 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 </details>
 
 <details>
-<summary>About tab</summary>
+<summary>Settings window, About page</summary>
 
-![CHD Manager, About tab](docs/screenshot-about.png)
+![CHD Manager, settings window on the About page](docs/screenshot-about.png)
+
+![CHD Manager, settings window on the Convert page](docs/screenshot-settings.png)
 
 </details>
 
@@ -30,15 +32,15 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 - **Safety.** Optional verify after creating each CHD. Optional "send sources to the Recycle Bin", and only after the new CHD passed verification, so your source files are never permanently deleted.
 - **Options.** Compression presets or custom codecs, hunk size, threads, skip/overwrite/rename existing files, output folder (with folder structure kept), per-track `.bin` extraction.
 - **Progress and log** for every job, an Info window, a summary of the space you saved, and a dark and a light theme.
-- **Updates.** One click checks MAME's latest chdman and, if you confirm, installs it (checksum-verified, with a backup of the old one). CHD Manager can also update itself from this repo's releases: it checks the SHA-256, test-runs the new version, then swaps it in and restarts. The prompt offers **Update now**, **Remind me next time**, or **Skip this version**, and a small badge stays in the window's header either way.
-- **An About tab** with the version, links, license info, the CHD Manager update controls, and a *Copy diagnostics* button for bug reports (it leaves out your folder paths and user name).
-- **A window that scales.** It opens wide enough that nothing is squeezed and spreads its table, options and log sensibly when you resize.
+- **Updates.** The two version buttons at the bottom of the window (chdman on the left, CHD Manager on the right) are also the update buttons: click one to check, and it turns orange when an update is waiting. One click checks MAME's latest chdman and, if you confirm, installs it (checksum-verified, with a backup of the old one). CHD Manager can also update itself from this repo's releases: it checks the SHA-256, test-runs the new version, then swaps it in and restarts. The prompt offers **Update now**, **Remind me next time**, or **Skip this version**, and a small badge stays in the window's header either way.
+- **A settings window** (More menu, or *Change settings…*) with the conversion options, output folder, the suggested-settings explanation, and an About page with the version, links, license info, the CHD Manager update controls, and a *Copy diagnostics* button for bug reports (it leaves out your folder paths and user name).
+- **A calm layout.** One list of discs, one line saying which settings will be used, and one Start button. The settings window, the log and the less common actions (verify, info, theme, updates) stay out of the way until you want them, and the log opens by itself if something fails. The window also scales sensibly when you resize it.
 
 ## Download and use
 
 1. Get the zip from the [Releases](../../releases) page and unzip it anywhere.
 2. Run **CHD Manager.exe**.
-3. Click **Add Files** or **Add Folder**, check the **Suggested** tab, press **Start**.
+3. Click **Add Files** or **Add Folder** (or drag them in), glance at the settings line under the list, and press **Start**.
 
 Windows 10/11, 64-bit. Python is not needed. Settings are saved in `chd_manager_settings.json` next to the exe.
 
@@ -59,7 +61,7 @@ Many PS2 CHDs you find online are CD-type (made with `createcd`), even for big D
 
 ## Network use
 
-CHD Manager is offline except for the update checks. Each has its own on/off switch (chdman in the **Output** tab, CHD Manager in the **About** tab):
+CHD Manager is offline except for the update checks. Each has its own on/off switch (chdman in the settings window's **Output** page, CHD Manager on its **About** page):
 
 - At startup it asks GitHub for the number of the latest MAME release, and for the latest CHD Manager release. It never downloads anything by itself.
 - When you confirm a CHD Manager update, it downloads the release zip from this repo (`github.com/Mr-Shizzy/CHD-Manager`), verifies its SHA-256, and only then replaces itself. If you're running the script instead of the exe, it just offers to open the download page.

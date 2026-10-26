@@ -1,7 +1,7 @@
 """
 CHD Manager - a friendly GUI for MAME's chdman.exe
 
-Put this file next to chdman.exe (or point it at chdman.exe in the Output tab).
+Put this file next to chdman.exe (or point it at chdman.exe in Settings, Output page).
 Needs only Python 3 (tkinter is included with it). Double-click to run.
 
 What it does
@@ -34,7 +34,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.2.2"
+APP_VER = "1.3.0"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -55,6 +55,38 @@ THEMES = {
                   accent="#6a4cf0", accent2="#8068ff", g1="#6a4cf0", g2="#0fb5d6",
                   info="#1b1e2b", cmd="#0b57d0", ok="#1a7f37", err="#c62828", warn="#b26a00", work="#0b57d0", skip="#777777"),
 }
+
+
+class _Tip:
+    """A small hover hint for a widget; text_fn() is called each time so it can reflect the current state."""
+
+    def __init__(self, widget, text_fn):
+        self.w, self.fn, self.tw, self.job = widget, text_fn, None, None
+        widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<ButtonPress>", self._leave, add="+")
+
+    def _enter(self, e=None):
+        self._leave()
+        self.job = self.w.after(500, self._show)
+
+    def _leave(self, e=None):
+        if self.job:
+            self.w.after_cancel(self.job)
+            self.job = None
+        if self.tw:
+            self.tw.destroy()
+            self.tw = None
+
+    def _show(self):
+        txt = self.fn()
+        if not txt:
+            return
+        tw = tk.Toplevel(self.w)
+        tw.wm_overrideredirect(True)
+        tw.geometry(f"+{self.w.winfo_rootx()}+{self.w.winfo_rooty() - 32}")
+        tk.Label(tw, text=txt, bg="#2a3042", fg="#ffffff", padx=9, pady=4, font=("Segoe UI", 9)).pack()
+        self.tw = tw
 
 
 def lerp_hex(c1, c2, t):
@@ -150,7 +182,7 @@ def fetch_latest():
     if not exe or not sums:
         raise RuntimeError("Could not find the Windows download or checksum file in the latest release "
                            "(MAME may have renamed it). Get it by hand from https://github.com/mamedev/mame/releases/latest "
-                           "and use the Browse button in the Output tab.")
+                           "and use the Browse button in Settings, Output page.")
     for url in (exe[1], sums):
         if not url.startswith("https://github.com/mamedev/mame/"):
             raise RuntimeError("Unexpected download address: " + url)
@@ -508,7 +540,7 @@ def build_suggestions(jobs, out_hint=None):
           "below your other programs and the PC stays usable. It still uses all free CPU time when you're idle.")
          if potato else
          f"Not needed: {cores} threads" + (f" and {ram:.0f} GB RAM" if ram else "") +
-         " is plenty, and the spare threads already keep Windows responsive. You can still tick it in the Convert tab."),
+         " is plenty, and the spare threads already keep Windows responsive. You can still tick it in Settings, Convert page."),
         ("If output exists", "Skip", "Never overwrites a CHD you already made; re-run safely after an interruption."),
         ("Verify after create", "On", "Checks each CHD's SHA-1 before you trust it (and before any source is recycled)."),
     ]
@@ -663,7 +695,7 @@ class App:
                 self.log("This chdman is too old to have 'createdvd'. DVD images will fall back to "
                          "'createcd'. Get a newer chdman (MAME 0.255 or later).", "warn")
         else:
-            self.log("chdman.exe not found. Put it next to this script or set it in the Output tab.", "err")
+            self.log("chdman.exe not found. Put it next to this script or set it in Settings, Output page.", "err")
         self.latest = None
         self.refresh_suggestions()
         self.root.after(80, self.pump)
@@ -677,8 +709,8 @@ class App:
     def build_ui(self):
         root = self.root
         root.title(f"{APP_NAME} {APP_VER}")
-        root.geometry(self.settings.get("geometry") or "1180x820")
-        root.minsize(1060, 680)
+        root.geometry(self.settings.get("geometry") or "1100x720")
+        root.minsize(940, 580)
         # variables
         self.v = {}
         for k, d in DEFAULTS.items():
@@ -694,43 +726,89 @@ class App:
         self.make_icon()
         self.build_header()
 
-        # toolbar
-        bar = ttk.Frame(root, padding=(10, 8, 10, 4))
+        # ---- toolbar: only the everyday actions. Everything else lives in the "More" menu or the settings window.
+        bar = ttk.Frame(root, padding=(18, 14, 18, 8))
         bar.pack(fill="x")
         self.toolbar = bar
 
         def btn(text, cmd):
             b = ttk.Button(bar, text=text, command=cmd)
-            b.pack(side="left", padx=(0, 6))
+            b.pack(side="left", padx=(0, 8))
             return b
 
-        btn("Add Files", self.add_files_dialog)
-        btn("Add Folder", self.add_folder_dialog)
+        btn("+  Add Files", self.add_files_dialog)
+        btn("+  Add Folder", self.add_folder_dialog)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(4, 12))
         btn("Remove", self.remove_selected)
-        btn("Clear", self.clear_all)
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        btn("Info", self.info_selected)
-        btn("Verify", self.verify_selected)
-        self.ver_label = ttk.Label(bar, style="Muted.TLabel")
-        self.ver_label.pack(side="right")
-        self.ver_label.config(text=f"chdman {self.chd_version}" if CHDMAN else "chdman not found")
-        self.upd_btn = ttk.Button(bar, text="chdman update", command=self.update_clicked)
-        self.upd_btn.pack(side="right", padx=(0, 10))
-        self.theme_btn = ttk.Button(bar, text="Light" if self.v["theme"].get() == "dark" else "Dark",
-                                    command=self.toggle_theme)
-        self.theme_btn.pack(side="right", padx=(0, 8))
+        btn("Clear all", self.clear_all)
+        self.more_btn = ttk.Button(bar, text="More  ▾", command=self.show_more_menu)
+        self.more_btn.pack(side="right")
 
-        # main split
+        self.more_menu = tk.Menu(root, tearoff=0)
+        self.more_menu.add_command(label="Settings…", command=lambda: self.open_settings("Convert"))
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label="Info about the selected disc…", command=self.info_selected)
+        self.more_menu.add_command(label="Verify the selected CHD files", command=self.verify_selected)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label=self.theme_menu_label(), command=self.toggle_theme)
+        self.theme_menu_index = self.more_menu.index("end")
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label="About CHD Manager…", command=lambda: self.open_settings("About"))
+
+        # ---- bottom, packed first so it always keeps its space: footer, then action bar, then the settings line
+        foot = ttk.Frame(root, padding=(18, 0, 18, 10))
+        foot.pack(fill="x", side="bottom")
+        self._footer_note = {"chdman": "", "app": ""}
+        self.chdman_btn = ttk.Button(foot, style="Subtle.TButton", command=self.update_clicked)
+        self.chdman_btn.pack(side="left")
+        self.upd_btn = self.chdman_btn                      # (state changes during a chdman update use this name)
+        self.app_btn = ttk.Button(foot, style="Subtle.TButton", command=self.app_footer_clicked)
+        self.app_btn.pack(side="right")
+        self.set_footer("chdman")
+        self.set_footer("app")
+        _Tip(self.chdman_btn, lambda: "Click to install the chdman update" if self.update_available()
+             else "Click to check for a newer chdman")
+        _Tip(self.app_btn, lambda: "Click to install the update" if self.app_update_available()
+             else "Click to check for a newer CHD Manager")
+
+        act = ttk.Frame(root, padding=(18, 8, 18, 8))
+        act.pack(fill="x", side="bottom")
+        self.start_btn = ttk.Button(act, text="▶  Start", style="Accent.TButton", command=self.start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(act, text="■  Stop", command=self.stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=8)
+        self.log_btn = ttk.Button(act, text="Show log", command=self.toggle_log)
+        self.log_btn.pack(side="right")
+        ttk.Button(act, text="Open output folder", command=self.open_output_folder).pack(side="right", padx=(0, 8))
+        pf = ttk.Frame(act)
+        pf.pack(side="left", fill="x", expand=True, padx=(18, 18))
+        self.status = ttk.Label(pf, text="Ready")
+        self.status.pack(anchor="w")
+        self.cur_bar = ttk.Progressbar(pf, maximum=100, style="Accent.Horizontal.TProgressbar")
+        self.cur_bar.pack(fill="x", pady=(4, 2))
+        self.all_bar = ttk.Progressbar(pf, maximum=100, style="Slim.Horizontal.TProgressbar")
+        self.all_bar.pack(fill="x")
+
+        strip = ttk.Frame(root, padding=(18, 2, 18, 2))
+        strip.pack(fill="x", side="bottom")
+        self.summary_label = ttk.Label(strip, style="Muted.TLabel")
+        self.summary_label.pack(side="left")
+        ttk.Button(strip, text="Change settings…", style="Subtle.TButton",
+                   command=lambda: self.open_settings("Convert")).pack(side="right")
+
+        # ---- main area: the list of discs. The log joins it only when asked for.
         pw = ttk.PanedWindow(root, orient="vertical")
-        pw.pack(fill="both", expand=True, padx=10, pady=4)
+        pw.pack(fill="both", expand=True, padx=18, pady=(2, 4))
+        self.pw = pw
 
         top = ttk.Frame(pw)
-        pw.add(top, weight=3)
+        pw.add(top, weight=1)
         cols = ("file", "action", "platform", "type", "size", "status", "result", "folder")
-        self.tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="extended")
-        for c, t, w, a in (("file", "File", 260, "w"), ("action", "Action", 70, "w"), ("platform", "Platform", 98, "w"),
-                           ("type", "Disc type", 90, "w"), ("size", "Size", 80, "e"), ("status", "Status", 150, "w"),
-                           ("result", "Result", 280, "w"), ("folder", "Folder", 300, "w")):
+        self.tree = ttk.Treeview(top, columns=cols, displaycolumns=("file", "action", "platform", "type", "size", "status", "result"),
+                                 show="headings", selectmode="extended")
+        for c, t, w, a in (("file", "File", 250, "w"), ("action", "Action", 80, "w"), ("platform", "Platform", 100, "w"),
+                           ("type", "Disc type", 90, "w"), ("size", "Size", 90, "e"), ("status", "Status", 150, "w"),
+                           ("result", "Result", 230, "w"), ("folder", "Folder", 300, "w")):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor=a, stretch=(c in ("file", "status", "result", "folder")))
         ys = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
@@ -741,8 +819,8 @@ class App:
         xs.grid(row=1, column=0, sticky="ew")
         top.rowconfigure(0, weight=1)
         top.columnconfigure(0, weight=1)
-        self.empty = ttk.Label(top, justify="center", style="Empty.TLabel", font=("Segoe UI", 11),
-                               text="Drag files or folders here, or click “Add Files” / “Add Folder”\n\n"
+        self.empty = ttk.Label(top, justify="center", style="Empty.TLabel", font=("Segoe UI", 12),
+                               text="Drag files or folders here, or use “Add Files” / “Add Folder”\n\n"
                                     ".cue / .gdi / .iso / .toc  →  CHD (CD or DVD chosen for you)\n"
                                     ".chd  →  extract or verify")
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
@@ -762,52 +840,42 @@ class App:
         self.menu.add_separator()
         self.menu.add_command(label="Remove from list", command=self.remove_selected)
 
-        # bottom: options (left) + log (right)
-        bottom = ttk.Frame(pw)
-        pw.add(bottom, weight=2)
-        bottom.columnconfigure(0, weight=1, minsize=660, uniform="bottom")
-        bottom.columnconfigure(1, weight=1, minsize=420, uniform="bottom")
-        bottom.rowconfigure(0, weight=1)
-
-        nb = ttk.Notebook(bottom)
-        nb.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.nb = nb
-        self.build_options(nb)
-
-        logf = ttk.Frame(bottom)
-        logf.grid(row=0, column=1, sticky="nsew")
-        logf.rowconfigure(0, weight=1)
-        logf.columnconfigure(0, weight=1)
-        self.logbox = tk.Text(logf, height=8, wrap="word", font=("Consolas", 9), state="disabled")
-        ls = ttk.Scrollbar(logf, command=self.logbox.yview)
+        # the log (hidden until "Show log", or until something fails)
+        self.logf = ttk.Frame(pw)
+        self.logf.rowconfigure(0, weight=1)
+        self.logf.columnconfigure(0, weight=1)
+        self.logbox = tk.Text(self.logf, height=9, wrap="word", font=("Consolas", 9), state="disabled")
+        ls = ttk.Scrollbar(self.logf, command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=ls.set)
         self.logbox.grid(row=0, column=0, sticky="nsew")
         ls.grid(row=0, column=1, sticky="ns")
-        lb = ttk.Frame(logf)
-        lb.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(lb, text="Copy log", command=self.copy_log).pack(side="left", padx=(0, 6))
-        ttk.Button(lb, text="Save log…", command=self.save_log).pack(side="left", padx=(0, 6))
-        ttk.Button(lb, text="Clear log", command=self.clear_log).pack(side="left")
+        lb = ttk.Frame(self.logf)
+        lb.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(lb, text="Copy log", style="Subtle.TButton", command=self.copy_log).pack(side="left", padx=(0, 6))
+        ttk.Button(lb, text="Save log…", style="Subtle.TButton", command=self.save_log).pack(side="left", padx=(0, 6))
+        ttk.Button(lb, text="Clear log", style="Subtle.TButton", command=self.clear_log).pack(side="left")
 
-        # action bar
-        act = ttk.Frame(root, padding=(10, 4, 10, 12))
-        act.pack(fill="x", side="bottom")
-        pw.pack_forget()
-        pw.pack(fill="both", expand=True, padx=10, pady=4)
-        self.start_btn = ttk.Button(act, text="▶  Start", style="Accent.TButton", command=self.start)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(act, text="■  Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
-        ttk.Button(act, text="Open output folder", command=self.open_output_folder).pack(side="left")
-        pf = ttk.Frame(act)
-        pf.pack(side="left", fill="x", expand=True, padx=(16, 0))
-        self.status = ttk.Label(pf, text="Ready")
-        self.status.pack(anchor="w")
-        self.cur_bar = ttk.Progressbar(pf, maximum=100, style="Accent.Horizontal.TProgressbar")
-        self.cur_bar.pack(fill="x", pady=(3, 3))
-        self.all_bar = ttk.Progressbar(pf, maximum=100, style="Slim.Horizontal.TProgressbar")
-        self.all_bar.pack(fill="x")
+        # ---- settings live in their own window, not on the main screen
+        sw = tk.Toplevel(root)
+        sw.withdraw()
+        sw.title("CHD Manager settings")
+        sw.transient(root)
+        sw.minsize(700, 520)
+        sw.protocol("WM_DELETE_WINDOW", sw.withdraw)
+        self.settings_win = sw
+        nb = ttk.Notebook(sw)
+        nb.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        self.nb = nb
+        self.build_options(nb)
+        bf = ttk.Frame(sw)
+        bf.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(bf, text="Done", style="Accent.TButton", command=sw.withdraw).pack(side="right")
+
+        for key in ("compression", "custom_comp", "hunk", "threads", "verify_after", "low_priority", "delete_src",
+                    "exists", "out_mode", "out_dir", "auto_suggest"):
+            self.v[key].trace_add("write", lambda *a: self.refresh_summary())
         self.style_widgets()
+        self.refresh_summary()
         self.root.after(120, self.fit_toolbar)
         self.enable_file_drop()
 
@@ -956,11 +1024,15 @@ class App:
                      padding=(26, 10))
         st.map("Accent.TButton", background=[("disabled", t["btn"]), ("pressed", t["accent2"]), ("active", t["accent2"])],
                foreground=[("disabled", t["muted"])])
-        st.configure("Treeview", background=t["panel"], fieldbackground=t["panel"], foreground=t["fg"], rowheight=27,
+        st.configure("Subtle.TButton", background=t["bg"], foreground=t["muted"], padding=(8, 3), font=("Segoe UI", 9))
+        st.map("Subtle.TButton", background=[("active", t["btn"])], foreground=[("active", t["fg"]), ("disabled", t["muted"])])
+        st.configure("SubtleWarn.TButton", background=t["bg"], foreground=t["warn"], padding=(8, 3), font=("Segoe UI Semibold", 9))
+        st.map("SubtleWarn.TButton", background=[("active", t["btn"])], foreground=[("disabled", t["muted"])])
+        st.configure("Treeview", background=t["panel"], fieldbackground=t["panel"], foreground=t["fg"], rowheight=31,
                      borderwidth=0, relief="flat")
         st.map("Treeview", background=[("selected", t["sel"])], foreground=[("selected", t["fg"])])
         st.configure("Treeview.Heading", background=t["head"], foreground=t["muted"], relief="flat", borderwidth=0,
-                     font=("Segoe UI Semibold", 9), padding=(8, 6))
+                     font=("Segoe UI Semibold", 9), padding=(10, 8))
         st.map("Treeview.Heading", background=[("active", t["btn_hover"])])
         st.configure("TNotebook", background=t["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
         st.configure("TNotebook.Tab", background=t["btn"], foreground=t["muted"], padding=(16, 7), borderwidth=0,
@@ -1009,6 +1081,9 @@ class App:
             self.sugg_text.tag_configure(tag, foreground=col)
             if font:
                 self.sugg_text.tag_configure(tag, font=font)
+        self.settings_win.configure(bg=t["bg"])
+        self.more_menu.configure(bg=t["panel"], fg=t["fg"], activebackground=t["accent"], activeforeground="#ffffff",
+                                 bd=0, relief="flat")
         self.menu.configure(bg=t["panel"], fg=t["fg"], activebackground=t["accent"], activeforeground="#ffffff",
                             bd=0, relief="flat")
         self.draw_header()
@@ -1025,21 +1100,21 @@ class App:
         self._icon = img
 
     def build_header(self):
-        self.hdr = tk.Canvas(self.root, height=68, highlightthickness=0, bd=0)
+        self.hdr = tk.Canvas(self.root, height=62, highlightthickness=0, bd=0)
         self.hdr.pack(fill="x")
         self.hdr_state, self.spin_angle, self.arcs = "idle", 0, []
         self.hdr.bind("<Configure>", lambda e: self.draw_header())
 
     def draw_header(self):
         c, t = self.hdr, self.t
-        w, h = max(c.winfo_width(), 400), 68
+        w, h = max(c.winfo_width(), 400), 62
         c.configure(bg=t["bg"])
         c.delete("all")
         n = max(1, w // 5)
         for i in range(n):
             c.create_rectangle(int(i * w / n), 0, int((i + 1) * w / n) + 1, h,
                                fill=lerp_hex(t["g1"], t["g2"], i / n), outline="")
-        cx, cy, r = 42, 34, 23
+        cx, cy, r = 40, 31, 20
         base = lerp_hex(t["g1"], t["g2"], cx / w)
         c.create_oval(cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3, fill=lerp_hex(base, "#000000", 0.25), outline="")
         c.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#f4f6ff", outline="")
@@ -1047,15 +1122,15 @@ class App:
                                   extent=42, style="pieslice", fill=lerp_hex("#f4f6ff", base, 0.45), outline="")
                      for k in range(4)]
         c.create_oval(cx - 7, cy - 7, cx + 7, cy + 7, fill=base, outline="#ffffff", width=2)
-        c.create_text(84, 26, text="CHD Manager", anchor="w", fill="#ffffff", font=("Segoe UI Semibold", 19))
-        c.create_text(86, 52, text="Compress & convert disc images  ·  CD / DVD detected for you", anchor="w",
+        c.create_text(76, 23, text="CHD Manager", anchor="w", fill="#ffffff", font=("Segoe UI Semibold", 17))
+        c.create_text(78, 47, text="Compress & convert disc images  ·  CD / DVD detected for you", anchor="w",
                       fill="#eef0ff", font=("Segoe UI", 9))
         label, col = {"idle": ("●  Ready", "#ffffff"), "run": ("●  Working…", "#fff1b8"),
                       "done": ("✔  Finished", "#c9ffe4"), "fail": ("●  Finished with errors", "#ffd4d4")}[self.hdr_state]
-        c.create_text(w - 20, 30, text=label, anchor="e", fill=col, font=("Segoe UI Semibold", 12))
+        c.create_text(w - 20, 24, text=label, anchor="e", fill=col, font=("Segoe UI Semibold", 11))
         if self.app_update_available():
             nv = ".".join(str(x) for x in ver_tuple(self.app_latest["tag"]))
-            c.create_text(w - 20, 53, text=f"▲  Update {nv} available - click", anchor="e", fill="#fff1b8",
+            c.create_text(w - 20, 46, text=f"▲  Update {nv} available - click", anchor="e", fill="#fff1b8",
                           font=("Segoe UI Semibold", 10), tags="updbadge")
             c.tag_bind("updbadge", "<Button-1>", lambda e: self.confirm_app_update())
             c.tag_bind("updbadge", "<Enter>", lambda e: c.configure(cursor="hand2"))
@@ -1084,7 +1159,7 @@ class App:
         new = "light" if self.v["theme"].get() == "dark" else "dark"
         self.v["theme"].set(new)
         self.t = THEMES[new]
-        self.theme_btn.config(text="Light" if new == "dark" else "Dark")
+        self.more_menu.entryconfigure(self.theme_menu_index, label=self.theme_menu_label())
         self.apply_ttk_theme()
         self.style_widgets()
         self.restripe()
@@ -1115,7 +1190,7 @@ class App:
             has_convert = any(j.kind == "convert" for j in self.jobs)
             self.apply_suggestions(quiet=True, hardware_only=not has_convert)   # PC-specific settings apply at startup
             if first_add and has_convert:
-                self.nb.select(0)
+                self.refresh_summary()
 
     def render_suggestions(self):
         s, tx = self.sugg, self.sugg_text
@@ -1132,7 +1207,7 @@ class App:
             tx.insert("end", "•  " + n + "\n", "note")
         auto = self.v["auto_suggest"].get() and any(j.kind == "convert" for j in self.jobs)
         if auto:
-            tx.insert("end", "\n✔ These settings were applied to the Convert tab.", "ok")
+            tx.insert("end", "\n✔ These settings were applied (see the settings line under the list).", "ok")
         tx.configure(state="disabled")
 
     def apply_suggestions(self, quiet=False, hardware_only=False):
@@ -1200,12 +1275,92 @@ class App:
         self.log(f"Dropped {len(paths)} item(s).", "info")
         self.add_paths(paths)
 
+    # ------------------------------------------------------------------ layout helpers (menu, settings window, log, summary)
+    def footer_base(self, which):
+        if which == "chdman":
+            return f"chdman {self.chd_version}" if CHDMAN else "chdman not found"
+        return f"CHD Manager {APP_VER}"
+
+    def set_footer(self, which, note="", tone="muted", revert_after=0):
+        """Each footer button shows its component and version; a short note (checking, up to date, update available)
+        is appended and can clear itself after a few seconds."""
+        btn = self.chdman_btn if which == "chdman" else self.app_btn
+        self._footer_note[which] = note
+        btn.config(text=self.footer_base(which) + (f"  ·  {note}" if note else ""),
+                   style="SubtleWarn.TButton" if tone == "warn" else "Subtle.TButton")
+        self.root.after(50, self.fit_toolbar)
+        if revert_after:
+            self.root.after(revert_after, lambda: self.set_footer(which) if self._footer_note.get(which) == note else None)
+
+    def app_footer_clicked(self):
+        if self.running:
+            self.status.config(text="Wait for the current jobs to finish before updating CHD Manager.")
+            return
+        if self.app_update_available():
+            self.confirm_app_update()
+        else:
+            self.check_app_update_async(True)
+
+    def theme_menu_label(self):
+        return "Switch to the light theme" if self.v["theme"].get() == "dark" else "Switch to the dark theme"
+
+    def show_more_menu(self):
+        self.more_menu.update_idletasks()
+        x = self.more_btn.winfo_rootx() + self.more_btn.winfo_width() - self.more_menu.winfo_reqwidth()
+        self.more_menu.tk_popup(max(x, 0), self.more_btn.winfo_rooty() + self.more_btn.winfo_height())
+
+    def open_settings(self, tab="Convert"):
+        w = self.settings_win
+        if not getattr(self, "_settings_placed", False):
+            w.geometry(f"780x580+{max(self.root.winfo_rootx() + 80, 0)}+{max(self.root.winfo_rooty() + 60, 0)}")
+            self._settings_placed = True
+        w.deiconify()
+        w.lift()
+        names = {self.nb.tab(i, "text"): i for i in range(self.nb.index("end"))}
+        if tab in names:
+            self.nb.select(names[tab])
+
+    def show_log(self, show):
+        shown = str(self.logf) in self.pw.panes()
+        if show and not shown:
+            self.pw.add(self.logf, weight=1)
+        elif not show and shown:
+            self.pw.forget(self.logf)
+        self.log_btn.config(text="Hide log" if show else "Show log")
+
+    def toggle_log(self):
+        self.show_log(str(self.logf) not in self.pw.panes())
+
+    def summary_text(self):
+        o = self.options()
+        comp = o["compression"] if o["compression"] != "Custom" else f"custom ({o['custom_comp'].strip() or 'default'})"
+        parts = [f"{comp.lower()} compression" if o["compression"] != "Default" else "default compression",
+                 f"{o['threads']} threads" if o["threads"] else "all threads"]
+        if str(o["hunk"]).strip():
+            parts.append(f"hunk {str(o['hunk']).strip()}")
+        parts.append("verify after" if o["verify_after"] else "no verify")
+        parts.append({"Skip": "skip existing", "Overwrite": "overwrite existing", "Rename": "rename if exists"}.get(o["exists"], "skip existing"))
+        parts.append("saved next to the originals" if o["out_mode"] == "same" or not o["out_dir"]
+                     else f"saved to {Path(o['out_dir']).name or o['out_dir']}")
+        if o["low_priority"]:
+            parts.append("low priority")
+        if o["delete_src"]:
+            parts.append("recycle originals after verify")
+        lead = "Suggested settings:  " if o["auto_suggest"] else "Settings:  "
+        return lead + "  ·  ".join(parts)
+
+    def refresh_summary(self):
+        try:
+            self.summary_label.config(text=self.summary_text())
+        except (tk.TclError, AttributeError):
+            pass
+
     def fit_toolbar(self):
         """Keep the window wide enough that no toolbar button is squeezed (the label text changes at runtime)."""
         try:
             self.root.update_idletasks()
             need = self.toolbar.winfo_reqwidth() + 24
-            self.root.minsize(max(1000, need), 680)
+            self.root.minsize(max(900, need), 580)
             if self.root.winfo_width() < need:
                 self.root.geometry(f"{need}x{self.root.winfo_height()}")
         except tk.TclError:
@@ -1256,7 +1411,7 @@ class App:
             CHDMAN = p
             self.chd_path_var.set(p)
             self.chd_version, self.has_dvd = chdman_info()
-            self.ver_label.config(text=f"chdman {self.chd_version}")
+            self.set_footer("chdman")
             self.root.after(50, self.fit_toolbar)
             self.log(f"Using {p} (chdman {self.chd_version})", "info")
 
@@ -1439,7 +1594,7 @@ class App:
             return
         if not CHDMAN:
             if not self.silent:
-                messagebox.showerror(APP_NAME, "chdman.exe was not found. Set it in the Output tab.")
+                messagebox.showerror(APP_NAME, "chdman.exe was not found. Set it in Settings, Output page.")
             return
         todo = [j for j in (only if only is not None else self.jobs) if not j.status.startswith("Done")]
         if not todo:
@@ -1593,7 +1748,7 @@ class App:
         if job.lone_bin:
             if not o["auto_cue"]:
                 job.status = "No CUE"
-                self.post("log", f"{job.path.name}: .bin without a CUE (enable auto-create in Convert tab).", "err")
+                self.post("log", f"{job.path.name}: .bin without a CUE (enable auto-create in Settings, Convert page).", "err")
                 return
             temp_cue = job.path.with_name(job.path.stem + ".__chdm_auto__.cue")
             temp_cue.write_text(f'FILE "{job.path.name}" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n', "utf-8")
@@ -1800,6 +1955,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
         if manual:
             self.status.config(text="Checking GitHub for a newer CHD Manager…")
+            self.set_footer("app", "checking…")
 
     def app_update_available(self):
         return bool(getattr(self, "app_latest", None) and ver_tuple(self.app_latest["tag"]) > ver_tuple(APP_VER))
@@ -1857,20 +2013,23 @@ class App:
             if manual:
                 self.status.config(text="Could not check for a CHD Manager update.")
                 self.log("CHD Manager update check failed: " + err, "warn")
+                self.set_footer("app", "couldn't check", revert_after=8000)
             return
         self.app_latest = info
         new_v = ".".join(str(x) for x in ver_tuple(info["tag"]))
         if not self.app_update_available():
             self.draw_header()
             self.app_upd_label.config(text=f"Up to date ({APP_VER}).", style="Muted.TLabel")
+            self.set_footer("app", "up to date" if manual else "", revert_after=8000 if manual else 0)
             if manual:
                 self.status.config(text=f"CHD Manager {APP_VER} is the latest version.")
                 self.log(f"CHD Manager {APP_VER} is up to date.", "ok")
             return
         self.app_upd_label.config(text=f"{new_v} available (you have {APP_VER}).", style="Warn.TLabel")
+        self.set_footer("app", f"{new_v} available - click to update", "warn")
         self.draw_header()                      # shows the clickable "update available" badge
         self.log(f"A newer CHD Manager is available: {new_v} (you have {APP_VER}). Click the badge at the top right, "
-                 "or use the About tab.", "warn")
+                 "or use Settings, About page.", "warn")
         # startup: ask unless this exact version was skipped; the button and the badge always ask
         if manual or self.v["skip_version"].get() != info["tag"]:
             self.confirm_app_update()
@@ -1894,13 +2053,14 @@ class App:
         choice = self.ask_update_choice(msg)
         if choice == "skip":
             self.v["skip_version"].set(info["tag"])
-            self.log(f"Skipping {new_v} at startup. The update badge and the About tab still offer it.", "info")
+            self.log(f"Skipping {new_v} at startup. The update badge and Settings, About page still offer it.", "info")
         elif choice == "now":
             if not FROZEN:
                 if not self.silent:
                     webbrowser.open(info["page"])
                 return
             self.app_upd_btn.config(state="disabled")
+            self.app_btn.config(state="disabled")
             threading.Thread(target=self.app_update_worker, args=(info,), daemon=True).start()
         # "later": nothing recorded, so it asks again next launch
 
@@ -1930,6 +2090,8 @@ class App:
 
     def on_app_update_done(self, ok, msg):
         self.app_upd_btn.config(state="normal")
+        self.app_btn.config(state="normal")
+        self.set_footer("app")
         self.cur_bar["value"] = 0
         self.status.config(text="CHD Manager update failed - nothing was changed.")
         self.log("CHD Manager update failed: " + msg, "err")
@@ -1956,6 +2118,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
         if manual:
             self.status.config(text="Checking GitHub for the latest chdman…")
+            self.set_footer("chdman", "checking…")
 
     def update_available(self):
         cur = ver_to_int(self.chd_version) if CHDMAN else 0
@@ -1975,20 +2138,17 @@ class App:
             if manual:
                 self.status.config(text="Could not check for updates.")
                 self.log("Update check failed: " + err, "warn")
+                self.set_footer("chdman", "couldn't check", revert_after=8000)
             return
         self.latest = info
         new_txt = f"0.{info['num']:03d}"
         if self.update_available():
-            self.ver_label.config(text=f"chdman {self.chd_version or 'missing'}", style="Warn.TLabel")
-            self.root.after(50, self.fit_toolbar)
-            self.upd_btn.config(text=f"Update chdman to {new_txt}…")
+            self.set_footer("chdman", f"{new_txt} available - click to update", "warn")
             self.log(f"A newer chdman is available: {new_txt} (you have {self.chd_version or 'none'}).", "warn")
             if manual:
                 self.confirm_install()
         else:
-            self.ver_label.config(text=f"chdman {self.chd_version} (latest)", style="Muted.TLabel")
-            self.root.after(50, self.fit_toolbar)
-            self.upd_btn.config(text="chdman update")
+            self.set_footer("chdman", "up to date" if manual else "", revert_after=8000 if manual else 0)
             if manual:
                 self.status.config(text=f"chdman is up to date ({self.chd_version}).")
                 self.log(f"chdman {self.chd_version} is the latest release.", "ok")
@@ -2009,7 +2169,7 @@ class App:
             self.notify("No problem. Without 7-Zip, CHD Manager can't update chdman automatically, so the update "
                         "button won't work. Everything else in the program works normally.\n\n"
                         "To update by hand, download chdman from github.com/mamedev/mame/releases and pick it with "
-                        "Browse in the Output tab. You can also install 7-Zip later from 7-zip.org.")
+                        "Browse in Settings, Output page. You can also install 7-Zip later from 7-zip.org.")
             return False
         self.status.config(text="Installing 7-Zip… (approve the Windows prompt if it appears)")
         self.root.update_idletasks()
@@ -2111,9 +2271,7 @@ class App:
         CHDMAN = a
         self.chd_path_var.set(a)
         self.chd_version, self.has_dvd = chdman_info()
-        self.ver_label.config(text=f"chdman {self.chd_version} (latest)", style="Muted.TLabel")
-        self.root.after(50, self.fit_toolbar)
-        self.upd_btn.config(text="chdman update")
+        self.set_footer("chdman", "updated", revert_after=8000)
         self.status.config(text=f"chdman updated to {self.chd_version}.")
         self.log(f"chdman updated to {self.chd_version}: {a}", "ok")
         if c:
@@ -2157,6 +2315,8 @@ class App:
                     self.status.config(text=ev[1])
                     self.log("\n" + ev[1], "ok" if ev[2] else "warn")
                     self.set_state("done" if ev[2] else "fail")
+                    if not ev[2]:
+                        self.show_log(True)
                     self.cur_bar["value"] = 0
                     self.proc = None
                     if not self.silent:
