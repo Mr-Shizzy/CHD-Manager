@@ -27,13 +27,14 @@ import threading
 import time
 import traceback
 import urllib.request
+import webbrowser
 import tkinter as tk
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.1"
+APP_VER = "1.2.0"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -319,6 +320,98 @@ def recycle(paths):
     return res == 0 and not op.fAnyOperationsAborted
 
 
+# ------------------------------------------------- CHD Manager's own updates (GitHub releases)
+APP_REPO = "Mr-Shizzy/CHD-Manager"
+APP_RELEASE_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
+APP_URL_PREFIX = f"https://github.com/{APP_REPO}/"
+SWAP_BAT = """@echo off
+setlocal
+set "NEW={new}"
+set "OLD={old}"
+for /l %%i in (1,1,90) do (
+  move /y "%NEW%" "%OLD%" >nul 2>&1 && goto swapped
+  timeout /t 1 /nobreak >nul
+)
+echo Could not replace the program. The new version was saved as: %NEW%
+pause
+exit /b 1
+:swapped
+start "" "%OLD%"
+(goto) 2>nul & del "%~f0"
+"""
+
+
+def ver_tuple(s):
+    """'v1.2.0' / '1.2' -> (1, 2, 0)"""
+    nums = [int(x) for x in re.findall(r"\d+", s or "")][:3]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def fetch_app_release():
+    """Latest CHD Manager release -> dict(tag, name, url, size, sha, page, notes). Only trusts github.com/<repo>/."""
+    with http_get(APP_RELEASE_API) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    asset = next((a for a in data.get("assets", []) if re.fullmatch(r"CHD-Manager-.+-win64\.zip", a["name"])), None)
+    if not asset:
+        raise RuntimeError("The latest release has no Windows zip.")
+    if not asset["browser_download_url"].startswith(APP_URL_PREFIX):
+        raise RuntimeError("Unexpected download address: " + asset["browser_download_url"])
+    body = data.get("body") or ""
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", body)
+    return {"tag": data["tag_name"], "name": asset["name"], "url": asset["browser_download_url"],
+            "size": asset["size"], "sha": m.group(1) if m else "", "page": data.get("html_url", APP_URL_PREFIX + "releases"),
+            "notes": body.strip()}
+
+
+def stage_app_update(info, dest_dir, progress=None):
+    """Download the release zip, verify its SHA-256, and save the new exe next to the current one as
+    'CHD Manager.new.exe'. Returns that path. Refuses anything without a matching checksum."""
+    import zipfile
+    if not info["url"].startswith(APP_URL_PREFIX):
+        raise RuntimeError("Unexpected download address.")
+    if not info["sha"]:
+        raise RuntimeError("This release has no published checksum, so it can't be verified. Download it by hand.")
+    dest_dir = Path(dest_dir)
+    tmp = Path(tempfile.mkdtemp(prefix="chdm_app_update_"))
+    try:
+        zpath, h, got = tmp / info["name"], hashlib.sha256(), 0
+        with http_get(info["url"], 60) as r, open(zpath, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                if progress:
+                    progress(100 * got / max(info["size"], 1), f"Downloading {info['name']}: {fmt_size(got)} / {fmt_size(info['size'])}")
+        if h.hexdigest().lower() != info["sha"].lower():
+            raise RuntimeError("Checksum mismatch - the download was discarded.")
+        with zipfile.ZipFile(zpath) as z:
+            names = {Path(n).name: n for n in z.namelist() if not n.endswith("/")}
+            if "CHD Manager.exe" not in names:
+                raise RuntimeError("The zip does not contain CHD Manager.exe.")
+            exe_bytes = z.read(names["CHD Manager.exe"])
+            extras = {n: z.read(names[n]) for n in ("LICENSE", "THIRD_PARTY_NOTICES.txt") if n in names}
+        if exe_bytes[:2] != b"MZ":
+            raise RuntimeError("CHD Manager.exe in the zip is not a Windows program.")
+        new = dest_dir / "CHD Manager.new.exe"
+        new.write_bytes(exe_bytes)
+        for n, b in extras.items():
+            (dest_dir / n).write_bytes(b)
+        return new
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def write_swap_script(new_exe, old_exe):
+    """A tiny batch file that waits for the running program to exit, swaps in the new exe, and starts it."""
+    bat = Path(tempfile.gettempdir()) / f"chdm_swap_{os.getpid()}.bat"
+    text = SWAP_BAT.format(new=str(new_exe), old=str(old_exe)).replace("\n", "\r\n")
+    bat.write_bytes(text.encode("utf-8"))              # bytes: text mode would turn \r\n into \r\r\n
+    return bat
+
+
 # ------------------------------------------------------------------ smart suggestions
 def total_ram_gb():
     class MEMSTAT(ctypes.Structure):
@@ -490,7 +583,7 @@ DEFAULTS = {
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
     "chd_action": "Extract", "split_bin": False, "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
-    "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False,
+    "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
 
 
@@ -533,6 +626,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         if self.v["auto_update_check"].get() and not silent:
             self.root.after(1500, lambda: self.check_update_async(manual=False))
+        if self.v["auto_app_check"].get() and not silent:
+            self.root.after(2500, lambda: self.check_app_update_async(manual=False))
 
     # ------------------------------------------------------------------ UI
     def build_ui(self):
@@ -558,6 +653,7 @@ class App:
         # toolbar
         bar = ttk.Frame(root, padding=(10, 8, 10, 4))
         bar.pack(fill="x")
+        self.toolbar = bar
 
         def btn(text, cmd):
             b = ttk.Button(bar, text=text, command=cmd)
@@ -574,7 +670,7 @@ class App:
         self.ver_label = ttk.Label(bar, style="Muted.TLabel")
         self.ver_label.pack(side="right")
         self.ver_label.config(text=f"chdman {self.chd_version}" if CHDMAN else "chdman not found")
-        self.upd_btn = ttk.Button(bar, text="Check chdman update", command=self.update_clicked)
+        self.upd_btn = ttk.Button(bar, text="chdman update", command=self.update_clicked)
         self.upd_btn.pack(side="right", padx=(0, 10))
         self.theme_btn = ttk.Button(bar, text="Light" if self.v["theme"].get() == "dark" else "Dark",
                                     command=self.toggle_theme)
@@ -592,7 +688,7 @@ class App:
                            ("type", "Disc type", 90, "w"), ("size", "Size", 80, "e"), ("status", "Status", 150, "w"),
                            ("result", "Result", 280, "w"), ("folder", "Folder", 300, "w")):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor=a, stretch=(c in ("file", "folder")))
+            self.tree.column(c, width=w, anchor=a, stretch=(c in ("file", "status", "result", "folder")))
         ys = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(top, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -601,8 +697,8 @@ class App:
         xs.grid(row=1, column=0, sticky="ew")
         top.rowconfigure(0, weight=1)
         top.columnconfigure(0, weight=1)
-        self.empty = ttk.Label(top, justify="center", style="Muted.TLabel", font=("Segoe UI", 11),
-                               text="Click “Add Files…” or “Add Folder…”\n\n"
+        self.empty = ttk.Label(top, justify="center", style="Empty.TLabel", font=("Segoe UI", 11),
+                               text="Drag files or folders here, or click “Add Files” / “Add Folder”\n\n"
                                     ".cue / .gdi / .iso / .toc  →  CHD (CD or DVD chosen for you)\n"
                                     ".chd  →  extract or verify")
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
@@ -625,11 +721,12 @@ class App:
         # bottom: options (left) + log (right)
         bottom = ttk.Frame(pw)
         pw.add(bottom, weight=2)
-        bottom.columnconfigure(1, weight=1)
+        bottom.columnconfigure(0, weight=1, minsize=660, uniform="bottom")
+        bottom.columnconfigure(1, weight=1, minsize=420, uniform="bottom")
         bottom.rowconfigure(0, weight=1)
 
         nb = ttk.Notebook(bottom)
-        nb.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        nb.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.nb = nb
         self.build_options(nb)
 
@@ -667,6 +764,8 @@ class App:
         self.all_bar = ttk.Progressbar(pf, maximum=100, style="Slim.Horizontal.TProgressbar")
         self.all_bar.pack(fill="x")
         self.style_widgets()
+        self.root.after(120, self.fit_toolbar)
+        self.enable_file_drop()
 
     def build_options(self, nb):
         v = self.v
@@ -717,6 +816,10 @@ class App:
                                                     values=["Skip", "Overwrite", "Rename"]))
         ttk.Checkbutton(f, text="Run chdman at low priority (keeps Windows responsive)", variable=v["low_priority"]).grid(
             row=7, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
+                  text="Tip: 'Fast' uses zlib only, the safest pick if an emulator rejects a CHD "
+                       "(NetherSX2/AetherSX2 are reported to need zlib).").grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(f, text="Verify each CHD after creating it", variable=v["verify_after"]).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(f, text="Send source files to the Recycle Bin after a VERIFIED CHD",
@@ -754,6 +857,34 @@ class App:
         ttk.Checkbutton(f, text="Check for a newer chdman at startup (only asks GitHub; never downloads by itself)",
                         variable=v["auto_update_check"]).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
+        # --- About
+        f = tab("About")
+        ttk.Label(f, text=f"CHD Manager {APP_VER}", font=("Segoe UI Semibold", 14)).grid(row=0, column=0, columnspan=4, sticky="w")
+        lf = ttk.Frame(f)
+        lf.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for i, (text, url) in enumerate((("GitHub page and downloads", f"https://github.com/{APP_REPO}"),
+                                         ("Report a problem", f"https://github.com/{APP_REPO}/issues"),
+                                         ("chdman (MAME project)", "https://github.com/mamedev/mame"))):
+            lab = ttk.Label(lf, text=text, style="Link.TLabel", cursor="hand2")
+            lab.grid(row=0, column=i, padx=(0, 18))
+            lab.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+        ttk.Label(f, style="Muted.TLabel", wraplength=600, justify="left",
+                  text="Free and open source (0BSD license). chdman and the other bundled parts keep their own licenses, "
+                       "listed in THIRD_PARTY_NOTICES.txt. Not affiliated with MAME. No games or BIOS files are included; "
+                       "use it only with discs you own.").grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 6))
+        ttk.Separator(f).grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
+        self.app_upd_btn = ttk.Button(f, text="Check for CHD Manager update", command=lambda: self.check_app_update_async(True))
+        self.app_upd_btn.grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.app_upd_label = ttk.Label(f, text=f"You have {APP_VER}.", style="Muted.TLabel")
+        self.app_upd_label.grid(row=4, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(6, 0))
+        ttk.Checkbutton(f, text="Check for CHD Manager updates at startup (never installs by itself)",
+                        variable=v["auto_app_check"]).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        bf = ttk.Frame(f)
+        bf.grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(bf, text="Copy diagnostics", command=self.copy_diagnostics).pack(side="left")
+        ttk.Button(bf, text="Open program folder", command=lambda: os.startfile(str(HERE))).pack(side="left", padx=8)
+
+
     # ------------------------------------------------------------------ look & feel
     def apply_ttk_theme(self):
         t = self.t
@@ -770,7 +901,10 @@ class App:
         st.configure("TLabel", background=t["bg"], foreground=t["fg"])
         st.configure("Muted.TLabel", foreground=t["muted"])
         st.configure("Warn.TLabel", foreground=t["warn"])
-        st.configure("TButton", background=t["btn"], foreground=t["fg"], borderwidth=0, padding=(9, 6),
+        st.configure("Link.TLabel", foreground=t["g2"] if self.v["theme"].get() == "dark" else t["accent"],
+                     font=("Segoe UI", 10, "underline"))
+        st.configure("Empty.TLabel", foreground=t["muted"], background=t["panel"])
+        st.configure("TButton", background=t["btn"], foreground=t["fg"], borderwidth=0, padding=(10, 5), width=0,
                      focusthickness=0, relief="flat")
         st.map("TButton", background=[("disabled", t["bg"]), ("pressed", t["accent"]), ("active", t["btn_hover"])],
                foreground=[("disabled", t["muted"])])
@@ -874,7 +1008,14 @@ class App:
                       fill="#eef0ff", font=("Segoe UI", 9))
         label, col = {"idle": ("●  Ready", "#ffffff"), "run": ("●  Working…", "#fff1b8"),
                       "done": ("✔  Finished", "#c9ffe4"), "fail": ("●  Finished with errors", "#ffd4d4")}[self.hdr_state]
-        c.create_text(w - 20, 34, text=label, anchor="e", fill=col, font=("Segoe UI Semibold", 12))
+        c.create_text(w - 20, 30, text=label, anchor="e", fill=col, font=("Segoe UI Semibold", 12))
+        if self.app_update_available():
+            nv = ".".join(str(x) for x in ver_tuple(self.app_latest["tag"]))
+            c.create_text(w - 20, 53, text=f"▲  Update {nv} available - click", anchor="e", fill="#fff1b8",
+                          font=("Segoe UI Semibold", 10), tags="updbadge")
+            c.tag_bind("updbadge", "<Button-1>", lambda e: self.confirm_app_update())
+            c.tag_bind("updbadge", "<Enter>", lambda e: c.configure(cursor="hand2"))
+            c.tag_bind("updbadge", "<Leave>", lambda e: c.configure(cursor=""))
 
     def set_state(self, state):
         self.hdr_state = state
@@ -963,6 +1104,69 @@ class App:
                      f"threads {self.sugg['values']['threads'] or 'all'}, low priority {'on' if self.sugg['values']['low_priority'] else 'off'}, skip existing, verify on.", "info")
         self.render_suggestions()
 
+    # ------------------------------------------------------------------ drag and drop (native Windows)
+    def enable_file_drop(self):
+        """Let files/folders be dragged from Explorer onto the window. Uses the Windows shell API directly."""
+        if os.name != "nt":
+            return
+        try:
+            self.root.update_idletasks()
+            user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            WM_DROPFILES, GWLP_WNDPROC = 0x0233, -4
+            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            user32.CallWindowProcW.restype = ctypes.c_ssize_t
+            user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+            shell32.DragQueryFileW.restype = wintypes.UINT
+            shell32.DragFinish.argtypes = [wintypes.HANDLE]
+            old_proc = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+
+            def proc(h, msg, wparam, lparam):
+                if msg == WM_DROPFILES:
+                    paths = []
+                    try:
+                        count = shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
+                        for i in range(count):
+                            n = shell32.DragQueryFileW(wparam, i, None, 0)
+                            buf = ctypes.create_unicode_buffer(n + 1)
+                            shell32.DragQueryFileW(wparam, i, buf, n + 1)
+                            paths.append(buf.value)
+                    finally:
+                        shell32.DragFinish(wparam)
+                    if paths:
+                        self.root.after(10, lambda: self.on_files_dropped(paths))
+                    return 0
+                return user32.CallWindowProcW(old_proc, h, msg, wparam, lparam)
+
+            self._drop_proc = WNDPROC(proc)            # keep a reference or Python frees the callback
+            user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(self._drop_proc, ctypes.c_void_p).value)
+            shell32.DragAcceptFiles(hwnd, True)
+            for msg in (WM_DROPFILES, 0x0049, 0x004A):   # also accept drops when the sender runs at another privilege level
+                user32.ChangeWindowMessageFilterEx(hwnd, msg, 1, None)
+            self.drop_hwnd = hwnd
+        except Exception as e:  # noqa: BLE001
+            self.log(f"Drag and drop is unavailable: {e}", "warn")
+
+    def on_files_dropped(self, paths):
+        self.log(f"Dropped {len(paths)} item(s).", "info")
+        self.add_paths(paths)
+
+    def fit_toolbar(self):
+        """Keep the window wide enough that no toolbar button is squeezed (the label text changes at runtime)."""
+        try:
+            self.root.update_idletasks()
+            need = self.toolbar.winfo_reqwidth() + 24
+            self.root.minsize(max(1000, need), 680)
+            if self.root.winfo_width() < need:
+                self.root.geometry(f"{need}x{self.root.winfo_height()}")
+        except tk.TclError:
+            pass
+
     # ------------------------------------------------------------------ settings
     def save_settings(self):
         d = {k: var.get() for k, var in self.v.items()}
@@ -1009,6 +1213,7 @@ class App:
             self.chd_path_var.set(p)
             self.chd_version, self.has_dvd = chdman_info()
             self.ver_label.config(text=f"chdman {self.chd_version}")
+            self.root.after(50, self.fit_toolbar)
             self.log(f"Using {p} (chdman {self.chd_version})", "info")
 
     # ------------------------------------------------------------------ queue mgmt
@@ -1522,6 +1727,163 @@ class App:
             self.refresh_job(j)
         self.start(chds)
 
+    # ------------------------------------------------------------------ CHD Manager's own updates
+    def check_app_update_async(self, manual=False):
+        def work():
+            try:
+                self.post("app_upd_info", fetch_app_release(), "", manual)
+            except Exception as e:  # noqa: BLE001
+                self.post("app_upd_info", None, str(e), manual)
+        threading.Thread(target=work, daemon=True).start()
+        if manual:
+            self.status.config(text="Checking GitHub for a newer CHD Manager…")
+
+    def app_update_available(self):
+        return bool(getattr(self, "app_latest", None) and ver_tuple(self.app_latest["tag"]) > ver_tuple(APP_VER))
+
+    def diagnostics_text(self):
+        """Handy for bug reports. Deliberately leaves out folder paths and user names."""
+        ram = total_ram_gb()
+        return "\n".join([
+            f"CHD Manager {APP_VER} ({'exe' if FROZEN else 'script'})",
+            f"chdman {self.chd_version or 'not found'}" + ("" if self.has_dvd else " (no createdvd)"),
+            f"Windows: {platform.platform()}",
+            f"Python {sys.version.split()[0]}, Tk {tk.TkVersion}",
+            f"CPU threads: {os.cpu_count()}" + (f", RAM: {ram:.0f} GB" if ram else ""),
+            f"Settings: threads {self.v['threads'].get()}, compression {self.v['compression'].get()}, "
+            f"low priority {self.v['low_priority'].get()}, theme {self.v['theme'].get()}",
+        ])
+
+    def copy_diagnostics(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.diagnostics_text())
+        self.status.config(text="Diagnostics copied to the clipboard.")
+
+    def ask_update_choice(self, msg):
+        """Three-way prompt -> 'now' | 'later' | 'skip'."""
+        if self.silent:
+            return getattr(self, "silent_choice", None) or ("now" if getattr(self, "silent_answer", True) else "later")
+        result = {"v": "later"}
+        win = tk.Toplevel(self.root)
+        win.title("CHD Manager update")
+        win.configure(bg=self.t["bg"])
+        win.transient(self.root)
+        win.resizable(False, False)
+        ttk.Label(win, text=msg, wraplength=470, justify="left").pack(padx=22, pady=(20, 12))
+        bf = ttk.Frame(win)
+        bf.pack(padx=22, pady=(0, 18), anchor="e")
+
+        def pick(v):
+            result["v"] = v
+            win.destroy()
+
+        ttk.Button(bf, text="Update now", style="Accent.TButton", command=lambda: pick("now")).pack(side="left")
+        ttk.Button(bf, text="Remind me next time", command=lambda: pick("later")).pack(side="left", padx=8)
+        ttk.Button(bf, text="Skip this version", command=lambda: pick("skip")).pack(side="left")
+        win.protocol("WM_DELETE_WINDOW", lambda: pick("later"))
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + 120
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.wait_window()
+        return result["v"]
+
+    def on_app_update_info(self, info, err, manual):
+        if err or not info:
+            if manual:
+                self.status.config(text="Could not check for a CHD Manager update.")
+                self.log("CHD Manager update check failed: " + err, "warn")
+            return
+        self.app_latest = info
+        new_v = ".".join(str(x) for x in ver_tuple(info["tag"]))
+        if not self.app_update_available():
+            self.draw_header()
+            self.app_upd_label.config(text=f"Up to date ({APP_VER}).", style="Muted.TLabel")
+            if manual:
+                self.status.config(text=f"CHD Manager {APP_VER} is the latest version.")
+                self.log(f"CHD Manager {APP_VER} is up to date.", "ok")
+            return
+        self.app_upd_label.config(text=f"{new_v} available (you have {APP_VER}).", style="Warn.TLabel")
+        self.draw_header()                      # shows the clickable "update available" badge
+        self.log(f"A newer CHD Manager is available: {new_v} (you have {APP_VER}). Click the badge at the top right, "
+                 "or use the About tab.", "warn")
+        # startup: ask unless this exact version was skipped; the button and the badge always ask
+        if manual or self.v["skip_version"].get() != info["tag"]:
+            self.confirm_app_update()
+
+    def confirm_app_update(self):
+        info = self.app_latest
+        new_v = ".".join(str(x) for x in ver_tuple(info["tag"]))
+        notes = info["notes"].split("\n\n")[0][:300]
+        if self.running:
+            self.notify("Wait for the current jobs to finish, then click the update badge again.")
+            return
+        if FROZEN:
+            msg = (f"CHD Manager {new_v} is available (you have {APP_VER}).\n\n{notes}\n\n"
+                   f"Update now? It downloads {info['name']} ({fmt_size(info['size'])}) from github.com/{APP_REPO}, "
+                   "checks its SHA-256, test-runs it, and restarts into the new version. "
+                   "Your settings and chdman stay as they are.")
+        else:
+            msg = (f"CHD Manager {new_v} is available (you have {APP_VER}).\n\n{notes}\n\n"
+                   "You're running the script version, so it can't replace itself. "
+                   "'Update now' opens the download page.")
+        choice = self.ask_update_choice(msg)
+        if choice == "skip":
+            self.v["skip_version"].set(info["tag"])
+            self.log(f"Skipping {new_v} at startup. The update badge and the About tab still offer it.", "info")
+        elif choice == "now":
+            if not FROZEN:
+                if not self.silent:
+                    webbrowser.open(info["page"])
+                return
+            self.app_upd_btn.config(state="disabled")
+            threading.Thread(target=self.app_update_worker, args=(info,), daemon=True).start()
+        # "later": nothing recorded, so it asks again next launch
+
+    def app_update_worker(self, info):
+        report_dir = None
+        try:
+            new_exe = stage_app_update(info, HERE, lambda pct, txt: self.post("upd_progress", pct, txt))
+            self.post("upd_progress", 100, "Testing the new version…")
+            report_dir = Path(tempfile.mkdtemp(prefix="chdm_selfcheck_"))
+            report = report_dir / "report.json"
+            run_capture([str(new_exe), "--smoke", str(report)], timeout=180)
+            r = json.loads(report.read_text("utf-8")) if report.exists() else {}
+            if r.get("status") != "Done" or ver_tuple(r.get("app_version", "")) != ver_tuple(info["tag"]):
+                try:
+                    new_exe.unlink()
+                except OSError:
+                    pass
+                raise RuntimeError("The downloaded version failed its self-test, so it was not installed. "
+                                   + (r.get("error", "") or f"(status: {r.get('status')}, version: {r.get('app_version')})"))
+            old_exe = Path(sys.executable).resolve()
+            self.post("app_upd_ready", str(write_swap_script(new_exe, old_exe)))
+        except Exception as e:  # noqa: BLE001
+            self.post("app_upd_done", False, str(e))
+        finally:
+            if report_dir:
+                shutil.rmtree(report_dir, ignore_errors=True)
+
+    def on_app_update_done(self, ok, msg):
+        self.app_upd_btn.config(state="normal")
+        self.cur_bar["value"] = 0
+        self.status.config(text="CHD Manager update failed - nothing was changed.")
+        self.log("CHD Manager update failed: " + msg, "err")
+        if not self.silent:
+            messagebox.showerror(APP_NAME, "The update failed:\n" + msg + "\n\nYour current version was not changed.")
+
+    def on_app_update_ready(self, script):
+        self.status.config(text="Restarting into the new version…")
+        self.log("Restarting into the new version…", "ok")
+        self.app_swap_script = script
+        if self.silent:
+            return
+        subprocess.Popen(["cmd", "/c", script], creationflags=CREATE_NO_WINDOW | 0x00000008, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+        self.save_settings()
+        self.root.destroy()
+
     # ------------------------------------------------------------------ chdman update
     def check_update_async(self, manual=False):
         def work():
@@ -1556,13 +1918,15 @@ class App:
         new_txt = f"0.{info['num']:03d}"
         if self.update_available():
             self.ver_label.config(text=f"chdman {self.chd_version or 'missing'}", style="Warn.TLabel")
+            self.root.after(50, self.fit_toolbar)
             self.upd_btn.config(text=f"Update chdman to {new_txt}…")
             self.log(f"A newer chdman is available: {new_txt} (you have {self.chd_version or 'none'}).", "warn")
             if manual:
                 self.confirm_install()
         else:
             self.ver_label.config(text=f"chdman {self.chd_version} (latest)", style="Muted.TLabel")
-            self.upd_btn.config(text="Check chdman update")
+            self.root.after(50, self.fit_toolbar)
+            self.upd_btn.config(text="chdman update")
             if manual:
                 self.status.config(text=f"chdman is up to date ({self.chd_version}).")
                 self.log(f"chdman {self.chd_version} is the latest release.", "ok")
@@ -1686,7 +2050,8 @@ class App:
         self.chd_path_var.set(a)
         self.chd_version, self.has_dvd = chdman_info()
         self.ver_label.config(text=f"chdman {self.chd_version} (latest)", style="Muted.TLabel")
-        self.upd_btn.config(text="Check chdman update")
+        self.root.after(50, self.fit_toolbar)
+        self.upd_btn.config(text="chdman update")
         self.status.config(text=f"chdman updated to {self.chd_version}.")
         self.log(f"chdman updated to {self.chd_version}: {a}", "ok")
         if c:
@@ -1717,6 +2082,12 @@ class App:
                     self.status.config(text=ev[2])
                 elif kind == "upd_done":
                     self.on_update_done(ev[1], ev[2], ev[3], ev[4])
+                elif kind == "app_upd_info":
+                    self.on_app_update_info(ev[1], ev[2], ev[3])
+                elif kind == "app_upd_ready":
+                    self.on_app_update_ready(ev[1])
+                elif kind == "app_upd_done":
+                    self.on_app_update_done(ev[1], ev[2])
                 elif kind == "finish":
                     self.running = False
                     self.start_btn.config(state="normal")
@@ -1742,7 +2113,7 @@ class App:
 
 def smoke_test(outfile):
     """Hidden self-check used to verify the packaged exe: convert + verify a tiny disc, write a JSON report."""
-    report = {"frozen": FROZEN, "here": str(HERE)}
+    report = {"frozen": FROZEN, "here": str(HERE), "app_version": APP_VER}
     tmp = Path(tempfile.mkdtemp(prefix="chdm_smoke_"))
     try:
         root = tk.Tk()
