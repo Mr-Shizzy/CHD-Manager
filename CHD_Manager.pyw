@@ -972,6 +972,13 @@ def read_ccd(path):
         if not (mode and idx):
             raise UnpackError("this .ccd has a track without a mode or start position")
         trk.append((int(m.group(1)), int(mode.group(1)), int(idx.group(1))))
+    if not trk:                                     # some writers only give the [Entry] table of contents
+        for m in re.finditer(r"^\[Entry \d+\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S | re.I):
+            pt = re.search(r"^\s*Point\s*=\s*(0x[0-9a-f]+|\d+)", m.group(1), re.M | re.I)
+            ctl = re.search(r"^\s*Control\s*=\s*(0x[0-9a-f]+|\d+)", m.group(1), re.M | re.I)
+            lba = re.search(r"^\s*PLBA\s*=\s*(-?\d+)", m.group(1), re.M | re.I)
+            if pt and ctl and lba and 1 <= int(pt.group(1), 0) <= 99:
+                trk.append((int(pt.group(1), 0), 0 if not int(ctl.group(1), 0) & 4 else 1, int(lba.group(1))))
     trk.sort()
     if not trk:
         raise UnpackError("no tracks found in this .ccd")
@@ -1030,10 +1037,12 @@ def read_image(path):
 def image_sources(path, tracks):
     """Every file that belongs to an image set (for size, and for the Recycle Bin after a verified conversion)."""
     path = Path(path)
-    files = [path] + [t["file"] for t in tracks]
-    for e in (".ccd", ".mds", ".sub"):
-        if path.with_suffix(e).is_file():
-            files.append(path.with_suffix(e))
+    primary = path
+    if path.suffix.lower() == ".img":
+        primary = next((path.with_suffix(e) for e in (".ccd", ".mds") if path.with_suffix(e).is_file()), path)
+    files = [path, primary] + [t["file"] for t in tracks]
+    if primary.suffix.lower() == ".ccd" and primary.with_suffix(".sub").is_file():
+        files.append(primary.with_suffix(".sub"))
     seen, out = set(), []
     for f in files:
         if str(f).lower() not in seen:
