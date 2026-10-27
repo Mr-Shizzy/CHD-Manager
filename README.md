@@ -1,6 +1,6 @@
 # CHD Manager
 
-A friendly Windows app for turning disc images (`.cue`/`.bin`, `.gdi`, `.iso`, PlayStation `.pbp`, DiscJuggler `.cdi`) into compressed **CHD** files and back again. It works out whether each disc is a **CD or a DVD** for you, so there is no "which button do I press" guessing, and it picks sensible settings for your PC.
+A friendly Windows app for turning disc images (`.cue`/`.bin`, `.gdi`, `.iso`, PlayStation `.pbp`, DiscJuggler `.cdi`, Alcohol `.mds`/`.mdf`, Nero `.nrg`, CloneCD `.ccd`/`.img`) into compressed **CHD** files and back again, and for turning CHDs into PlayStation `.pbp` or DiscJuggler `.cdi` files. It works out whether each disc is a **CD or a DVD** for you, so there is no "which button do I press" guessing, and it picks sensible settings for your PC.
 
 CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github.com/mamedev/mame) project. It is portable: one folder, nothing installed, nothing written outside it.
 
@@ -37,6 +37,8 @@ CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github
 - **Queue** of files or folders. Loose `.bin` files that already belong to a `.cue` are skipped.
 - **CD or DVD, detected automatically.** `.cue`/`.gdi`/`.toc` are CD. An `.iso` is CD if it fits on a CD, DVD if it is larger, and PSP images are DVD. It also looks inside the image to label the platform (PS1, PS2, PSP, Dreamcast, Saturn, Sega CD). Right-click any item to force CD or DVD.
 - **PBP and CDI files work too.** PlayStation 1 `.pbp` files (including multi-disc ones, which become one CHD per disc plus an `.m3u` playlist) and DiscJuggler `.cdi` files (including Dreamcast CD-Rs with their two sessions) are unpacked in a hidden temporary folder, converted, and the temporary files are removed. Your original is never changed. PSP `.pbp` files are not PS1 discs and are refused with a message.
+- **Other disc-image formats too.** Alcohol 120% `.mds` + `.mdf`, Nero `.nrg`, CloneCD `.ccd` + `.img` and a bare `.img` are read directly and converted the same way (no need to convert them to CUE/BIN first). Drop either file of a pair; the partner is found next to it. Subchannel data (`.sub`) can't be stored in a CHD and is not used. Multi-session images are refused with a message.
+- **CHD to PBP and CHD to CDI.** With a CHD in the list, choose **PlayStation PBP** or **DiscJuggler CDI** as the format under *CHD files*. A PBP is made for PlayStation 1 discs only (the game code is read from the disc), is verified by reading it back, and is meant for emulators and frontends: it is not a signed PSP/Vita game and has no icon or boot logo. To make one PBP from a multi-disc game, add the game's `.m3u` playlist (the one this app writes next to the CHDs) instead of the separate CHDs. CDI is experimental.
 - **You choose what happens to CHD files.** Disc images (`.cue`, `.gdi`, `.iso`, `.toc`) become CHDs. When a CHD is in the list, a **CHD files** choice appears at the top: **Extract** it back to a disc image, **Verify** it, or **Recompress** it with different compression (your original is kept). When extracting you pick the format: **Automatic** (CUE/BIN for CDs, GDI for Dreamcast, ISO for DVDs), **ISO** for data discs, or CUE/BIN with one BIN per track or one single BIN. Automatic reads each CD's track count first: a disc with several tracks (audio plus data) gets one BIN per track, and a one-track disc gets a single BIN, with no setting to remember. Anything that comes out as several files (split CDs, Dreamcast GDI) is put in its own folder named after the disc, so a big batch stays tidy. ISO is only offered when nothing would be lost, so discs with audio, several tracks, or PS1-style audio/video sectors are refused instead of mangled. The Action column always spells out what will happen to each file, you can override a single file by right-clicking it, and a skipped job says why.
 - **Suggested settings.** It looks at your PC and your queue and fills in thread count, compression, and so on, with the reason for each. Weak PCs automatically get low-priority mode so Windows stays usable.
 - **Safety.** Optional verify after creating each CHD. Optional "send sources to the Recycle Bin", and only after the new CHD passed verification, so your source files are never permanently deleted.
@@ -61,7 +63,7 @@ Windows 10/11, 64-bit. Python is not needed. Settings are saved in `chd_manager_
 | Image | Type |
 | --- | --- |
 | `.cue`, `.gdi`, `.toc`, loose `.bin` | CD (`createcd`) |
-| `.pbp` (PlayStation 1), `.cdi` (DiscJuggler) | CD: unpacked to `.cue`/`.bin` in a temporary folder first, then `createcd` |
+| `.pbp` (PlayStation 1), `.cdi` (DiscJuggler), `.mds`/`.mdf`, `.nrg`, `.ccd`/`.img`, bare `.img` | CD: unpacked to `.cue`/`.bin` in a temporary folder first, then `createcd` (a lone 2048-byte data track larger than a CD goes through `createdvd`) |
 | `.iso` up to 737,280,000 bytes (an 80-minute CD) | CD |
 | `.iso` larger than that | DVD (`createdvd`) |
 | PSP images | DVD |
@@ -112,6 +114,9 @@ Tested on Windows 11 against **42 real discs**: 6 Dreamcast GD-ROM, 3 Dreamcast 
 | CHD to ISO (new in 1.4) | a CD CHD with Mode 2 raw sectors became a valid 2048-byte-per-sector ISO that PCSX2 booted; a MODE1/2048 CD CHD became an ISO byte-identical to an independently verified one; audio, multi-track, PS1-style Form 2 and GD-ROM discs were refused with a reason and left no files |
 | Recompress CHD (new in 1.4) | CD, GD-ROM and DVD CHDs recompressed with the same data checksum; the original is never overwritten |
 | PBP and CDI (new in 1.5) | 5 PBP files (one 2-disc, one 4-disc) and 4 Dreamcast CDI files converted and verified. Every sector of the PBP output has a valid sync pattern and the right address. PS1 games booted in DuckStation; Dreamcast CD-Rs booted in RetroArch/Flycast (menus, a race, a homebrew program's own screen) |
+| CHD to PBP (new in 1.5) | A one-disc game and a 2-disc game (through its playlist) were turned into PBPs, read back and compared block by block with the source, and unpacked again to byte-identical discs. For one game the first 16 KB of the PBP matched the original PBP except for size fields and the title. The single-disc and the 2-disc PBPs booted in DuckStation |
+| CHD to CDI (new in 1.5) | 4 Dreamcast CD-Rs: the CDI was read back and compared with the disc it was made from. The Aqua GT CDI came out the same size as the original with a header that differed only in a timestamp and a file name. Sturmwind and Millenium Racer booted in RetroArch/Flycast (title menu, a race), Aqua GT reached its title screen. The Dreamcast data session is placed at the sector its own filesystem expects, which is what made Sturmwind boot |
+| MDS/MDF, NRG, IMG, CCD (new in 1.5) | a real Alcohol `.mds`/`.mdf` (one data track), a real Nero `.nrg` (one data track), two bare `.img` files and a DVD-type `.mds` converted and verified; a CloneCD `.ccd`/`.img` pair (made by hand from a data + audio disc) gave a CHD with the same data SHA-1 as the original CUE/BIN |
 | Corrupted, truncated and non-CHD files | all flagged as failed, nothing crashed |
 | Overwrite / skip / rename, lone `.bin`, "recycle sources after a verified CHD" | behaved as described |
 
@@ -123,11 +128,13 @@ Tested on Windows 11 against **42 real discs**: 6 Dreamcast GD-ROM, 3 Dreamcast 
 
 **Not tested (PBP and CDI):** every disc of every multi-disc game (I booted discs 1 and 2 of the 2-disc game and discs 1 and 4 of the 4-disc one), swapping discs in a player, CDI files other than Dreamcast CD-Rs, and PBPs with audio tracks other than one patched test file. PSP `.pbp` files are not supported.
 
-**Not tested:** playing any game through (I only checked that each boots and shows its intro), emulators other than PCSX2, DuckStation and RetroArch/Flycast, other versions of chdman, or other versions of Windows. `.mds`, `.nrg`, `.ccd` and `.img` files aren't supported, so the app skips them and says so.
+**Not tested (new formats):** multi-track `.mds`, `.nrg` and real CloneCD files (the CloneCD pair was written by hand from a CUE/BIN, so it tests the reading code but not a real CloneCD file), multi-session images, `.nrg` files written in the older Nero format, CDI files in DiscJuggler itself (only read back by this program and booted in Flycast), PBP files on a real PSP/Vita/PS Classic (they carry no signed boot data), and PBPs with audio tracks written by this program.
 
+**Not tested:** playing any game through (I only checked that each boots and shows its intro), emulators other than PCSX2, DuckStation and RetroArch/Flycast, other versions of chdman, or other versions of Windows.
 ## Credits and license
 
 - `chdman` is from the [MAME](https://github.com/mamedev/mame) project and its authors. CHD Manager is not made by, affiliated with, or endorsed by MAME. "MAME" is a registered trademark of Gregory Ember.
+- The PBP writer follows the file layout used by [PSXPackager](https://github.com/RupertAvery/PSXPackager) (MIT, by RupertAvery); no code from it is included. See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 - Built with help from Claude (Anthropic); designed and tested by Mr-Shizzy.
 - This project includes no games, BIOS files, or other copyrighted game content. Use it only with discs you own.
 
