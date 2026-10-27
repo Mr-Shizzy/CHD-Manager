@@ -27,6 +27,7 @@ import threading
 import time
 import traceback
 import urllib.request
+import zlib
 import webbrowser
 import tkinter as tk
 from ctypes import wintypes
@@ -34,15 +35,15 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.4.0"
+APP_VER = "1.5.0"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 CD_MAX_BYTES = 737_280_000          # 80-minute CD: 360,000 sectors * 2048 bytes
-SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin"}
-UNSUPPORTED_EXTS = {".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".pbp", ".zip", ".7z", ".rar"}
+SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi"}
+UNSUPPORTED_EXTS = {".mds", ".mdf", ".nrg", ".ccd", ".img", ".zip", ".7z", ".rar"}
 CHDMAN = None                        # path to chdman.exe, set at startup
 
 THEMES = {
@@ -361,6 +362,8 @@ def decide_type(ext, size, platform):
     """-> (CD|DVD, reason)"""
     if ext in (".cue", ".gdi", ".toc", ".bin"):
         return "CD", "CUE/GDI/TOC images are CD-based"
+    if ext in (".pbp", ".cdi"):
+        return "CD", "PBP and CDI images are CD-based"
     if platform == "PSP":
         return "DVD", "PSP UMD image"
     if size <= CD_MAX_BYTES:
@@ -592,6 +595,217 @@ def build_suggestions(jobs, out_hint=None):
     return {"values": values, "rows": rows, "warnings": warnings, "notes": notes, "summary": summary}
 
 
+# ------------------------------------------- PBP and CDI images: unpacked to CUE/BIN, then handed to chdman
+class UnpackError(Exception):
+    pass
+
+
+CD_SYNC = b"\x00" + b"\xff" * 10 + b"\x00"
+
+
+def _bcd(n):
+    return ((n // 10) << 4) | (n % 10)
+
+
+def _unbcd(b):
+    return (b >> 4) * 10 + (b & 15)
+
+
+def cue_time(frames):
+    return "%02d:%02d:%02d" % (frames // 4500, frames // 75 % 60, frames % 75)
+
+
+def pbp_discs(path):
+    """Byte offset of each disc inside a PlayStation .pbp (one for most games, up to five for multi-disc)."""
+    with open(path, "rb") as f:
+        head = f.read(0x28)
+        if len(head) < 0x28 or head[:4] != b"\x00PBP":
+            raise UnpackError("not a PBP file")
+        psar = struct.unpack("<I", head[0x24:0x28])[0]
+        f.seek(psar)
+        magic = f.read(16)
+        if magic.startswith(b"PSISOIMG0000"):
+            return [psar]
+        if magic.startswith(b"PSTITLEIMG000000"):
+            f.seek(psar + 0x200)
+            offs = [o for o in struct.unpack("<5I", f.read(20)) if o]
+            if offs:
+                return [psar + o for o in offs]
+    raise UnpackError("this PBP is not a PlayStation 1 game (PSP games and other PBPs can't be converted)")
+
+
+def pbp_toc(f, base):
+    """-> ([(is_data, start_lba)], total_sectors) for one disc section."""
+    f.seek(base + 0x800)
+    raw = f.read(0x400)
+    tracks, total = [], 0
+    for i in range(0, len(raw) - 9, 10):
+        e = raw[i:i + 10]
+        point = e[2]
+        if point == 0:
+            break
+        lba = (_unbcd(e[7]) * 60 + _unbcd(e[8])) * 75 + _unbcd(e[9]) - 150
+        if point == 0xA2:
+            total = lba
+        elif point < 0xA0:
+            tracks.append((e[0] == 0x41, lba))
+    if not tracks or total <= 0:
+        raise UnpackError("the track table in this PBP is unreadable")
+    return tracks, total
+
+
+def unpack_pbp_disc(path, base, outdir, stem, progress, stopped):
+    """Decompress one disc of a PBP into outdir/stem.bin + stem.cue. Returns the cue path."""
+    outdir = Path(outdir)
+    bin_path, cue_path = outdir / (stem + ".bin"), outdir / (stem + ".cue")
+    with open(path, "rb") as f:
+        tracks, total = pbp_toc(f, base)
+        blocks = -(-total // 16)
+        f.seek(base + 0x4000)
+        index = f.read(blocks * 32)
+        if len(index) < blocks * 32:
+            raise UnpackError("the block table in this PBP is cut short")
+        data0, full = base + 0x100000, 16 * 2352
+        left = total * 2352
+        with open(bin_path, "wb") as g:
+            for b in range(blocks):
+                off, ln = struct.unpack("<IH", index[b * 32:b * 32 + 6])
+                f.seek(data0 + off)
+                raw = f.read(ln)
+                try:
+                    chunk = raw if ln == full else zlib.decompress(raw, -15)
+                except zlib.error:
+                    raise UnpackError(f"block {b} of this PBP is damaged") from None
+                if len(chunk) != full and b != blocks - 1:
+                    raise UnpackError(f"block {b} of this PBP has the wrong size")
+                g.write(chunk[:left])
+                left -= len(chunk)
+                if b % 64 == 0:
+                    progress(b / blocks)
+                    if stopped():
+                        raise UnpackError("stopped")
+    lines = [f'FILE "{bin_path.name}" BINARY']
+    for n, (is_data, lba) in enumerate(tracks, 1):
+        lines += [f"  TRACK {n:02d} {'MODE2/2352' if is_data else 'AUDIO'}", f"    INDEX 01 {cue_time(max(lba, 0))}"]
+    cue_path.write_text("\n".join(lines) + "\n", "utf-8")
+    progress(1.0)
+    return cue_path
+
+
+CDI_V2, CDI_V3, CDI_V35 = 0x80000004, 0x80000005, 0x80000006
+CDI_MARK = bytes([0, 0, 1, 0, 0, 0, 255, 255, 255, 255])
+
+
+def parse_cdi(path):
+    """Read a DiscJuggler .cdi. -> list of tracks: dict(session, mode 0=audio/1/2, ss=sector size, pregap,
+    length, start_lba, position=byte offset of the track in the file)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        if size < 16:
+            raise UnpackError("file too short to be a CDI")
+        f.seek(size - 8)
+        version, hdr = struct.unpack("<II", f.read(8))
+        if version not in (CDI_V2, CDI_V3, CDI_V35) or hdr == 0 or hdr > size:
+            raise UnpackError("not a DiscJuggler image this program understands")
+        f.seek(size - hdr if version == CDI_V35 else hdr)
+
+        def u(n):
+            b = f.read(n)
+            if len(b) != n:
+                raise UnpackError("the CDI's track table is cut short")
+            return int.from_bytes(b, "little")
+
+        def skip(n):
+            f.seek(n, 1)
+
+        sessions = u(2)
+        if not 0 < sessions < 100:
+            raise UnpackError("no sessions found in this CDI")
+        tracks, position = [], 0
+        for s in range(1, sessions + 1):
+            for _ in range(u(2)):
+                if u(4) != 0:
+                    skip(8)
+                if f.read(10) != CDI_MARK or f.read(10) != CDI_MARK:
+                    raise UnpackError("this CDI uses a track layout that isn't supported")
+                skip(4)
+                skip(u(1))
+                skip(19)
+                if u(4) == 0x80000000:
+                    skip(8)
+                skip(2)
+                pregap, length = u(4), u(4)
+                skip(6)
+                mode = u(4)
+                skip(12)
+                start_lba, total = u(4), u(4)
+                skip(16)
+                size_code = u(4)
+                if size_code not in (0, 1, 2) or mode > 2:
+                    raise UnpackError("this CDI has a track type that isn't supported")
+                ss = (2048, 2336, 2352)[size_code]
+                skip(29)
+                if version != CDI_V2:
+                    skip(5)
+                    if u(4) == 0xFFFFFFFF:
+                        skip(78)
+                tracks.append(dict(session=s, mode=mode, ss=ss, pregap=pregap, length=length,
+                                   start_lba=start_lba, position=position))
+                position += total * ss
+            skip(4 + 8 + (0 if version == CDI_V2 else 1))
+        if position > size or not tracks:
+            raise UnpackError("the CDI's track table doesn't match the file")
+        return tracks
+
+
+def unpack_cdi(path, outdir, stem, progress, stopped):
+    """Write each track of a CDI as outdir/stem (Track NN).bin plus stem.cue. Returns the cue path.
+    Mode 2 sectors stored without their 16-byte header get a proper one back, carrying the track's real
+    address. The empty gap between sessions (as on Dreamcast CD-Rs) is not stored: players such as Flycast
+    refuse CHDs with pregaps and place the second session themselves."""
+    outdir = Path(outdir)
+    tracks = parse_cdi(path)
+    all_sectors = sum(t["length"] for t in tracks) or 1
+    done = 0
+    lines = []
+    with open(path, "rb") as f:
+        for n, t in enumerate(tracks, 1):
+            mode, ss = t["mode"], t["ss"]
+            if mode == 0 and ss != 2352:
+                raise UnpackError("this CDI has an audio track with an unusual sector size")
+            if mode == 1 and ss == 2336 or mode == 2 and ss == 2048:
+                raise UnpackError("this CDI has a track type that isn't supported")
+            start = t["start_lba"] + t["pregap"] - 150          # where the track's INDEX 01 really is
+            name = f"{stem} (Track {n:02d}).bin"
+            kind = "AUDIO" if mode == 0 else "MODE1/2048" if ss == 2048 else f"MODE{mode}/2352"
+            lines += [f'FILE "{name}" BINARY', f"  TRACK {n:02d} {kind}"]
+            lines.append("    INDEX 01 00:00:00")
+            f.seek(t["position"] + t["pregap"] * ss)
+            step = 4096
+            with open(outdir / name, "wb") as g:
+                for first in range(0, t["length"], step):
+                    count = min(step, t["length"] - first)
+                    raw = f.read(count * ss)
+                    if len(raw) != count * ss:
+                        raise UnpackError("the CDI file is shorter than its track table says")
+                    if mode == 2 and ss == 2336:
+                        parts = []
+                        for i in range(count):
+                            a = start + first + i + 150
+                            parts.append(CD_SYNC + bytes((_bcd(a // 4500), _bcd(a // 75 % 60), _bcd(a % 75), 2)))
+                            parts.append(raw[i * 2336:(i + 1) * 2336])
+                        raw = b"".join(parts)
+                    g.write(raw)
+                    done += count
+                    progress(done / all_sectors)
+                    if stopped():
+                        raise UnpackError("stopped")
+    cue_path = outdir / (stem + ".cue")
+    cue_path.write_text("\n".join(lines) + "\n", "utf-8")
+    return cue_path
+
+
 KIND = {"Extract": "extract", "Verify": "verify", "Recompress": "recompress"}
 FORMAT_LABELS = {"auto": "Automatic (CUE/BIN, GDI or ISO)", "iso": "ISO (data discs)", "split": "CUE/BIN, one BIN per track",
                  "single": "CUE/BIN, one single BIN"}
@@ -635,6 +849,8 @@ class Job:
         self.platform = ""
         self.disc = ""                 # for CHDs: CD / GD-ROM / DVD / HD / ...
         self.tracks = 0                # for CD CHDs: number of tracks
+        self.container = None          # "pbp" | "cdi": unpacked to CUE/BIN before chdman sees it
+        self.disc_count = 1            # discs inside a PBP
         self.size = 0
         self.src_files = []
         self.missing = []
@@ -655,6 +871,17 @@ class Job:
             self.size = p.stat().st_size
             self.disc, self.tracks = chd_info(p) if CHDMAN else ("?", 0)
             self.src_files = [p]
+            return
+        if ext in (".pbp", ".cdi"):
+            self.container = ext[1:]
+            self.size = p.stat().st_size
+            self.src_files = [p]
+            if ext == ".pbp":
+                self.disc_count = len(pbp_discs(p))
+                self.platform = "PS1"
+            elif any(t["session"] > 1 and t["mode"] == 2 for t in parse_cdi(p)):
+                self.platform = "Dreamcast"
+            self.auto_type, self.reason = decide_type(ext, self.size, self.platform)
             return
         if ext == ".cue":
             refs = parse_cue(p)
@@ -1399,7 +1626,7 @@ class App:
 
     def action_text_for(self, job):
         if job.kind == "convert":
-            return "→ CHD"
+            return f"→ {job.disc_count} CHDs" if job.disc_count > 1 else "→ CHD"
         if job.kind == "verify":
             return "Verify"
         if job.kind == "recompress":
@@ -1559,7 +1786,7 @@ class App:
     def add_files_dialog(self):
         files = filedialog.askopenfilenames(
             title="Select disc images or CHD files", initialdir=self.settings.get("last_dir") or None,
-            filetypes=[("Disc images / CHD", "*.cue *.gdi *.iso *.toc *.bin *.chd"), ("All files", "*.*")])
+            filetypes=[("Disc images / CHD", "*.cue *.gdi *.iso *.toc *.bin *.pbp *.cdi *.chd"), ("All files", "*.*")])
         if files:
             self.settings["last_dir"] = str(Path(files[0]).parent)
             self.add_paths(files)
@@ -1584,7 +1811,7 @@ class App:
                 ignored = {}
                 for f in sorted(allf):
                     e = f.suffix.lower()
-                    if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso"):
+                    if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso", ".pbp", ".cdi"):
                         found.append((f, p))
                     elif e == ".bin" and str(f).lower() not in referenced:
                         found.append((f, p))
@@ -1592,7 +1819,7 @@ class App:
                         ignored[e] = ignored.get(e, 0) + 1
                 if ignored:
                     self.log(f"Ignored {sum(ignored.values())} file(s) chdman can't read directly ({', '.join(sorted(ignored))}). "
-                             "Convert .cdi/.nrg/.mds/.ccd images to .cue or .gdi first, and unpack archives.", "warn")
+                             "Convert .nrg/.mds/.ccd images to .cue or .gdi first, and unpack archives.", "warn")
             elif p.suffix.lower() in SRC_EXTS | {".chd"}:
                 found.append((p, None))
             else:
@@ -1889,7 +2116,97 @@ class App:
             a += ["-np", str(o["threads"])]
         return a
 
+    def do_convert_container(self, job, o):
+        """.pbp / .cdi -> unpack to CUE/BIN in a temporary folder, then chdman createcd. A multi-disc PBP
+        becomes one CHD per disc plus an .m3u playlist."""
+        stem, n = job.path.stem, job.disc_count
+        first = self.output_path(job, o, ".chd")
+        outs = [first] if n == 1 else [first.with_name(f"{stem} (Disc {i}).chd") for i in range(1, n + 1)]
+        tmp = first.parent / f".{stem[:40]}.chdm_tmp"
+        made, skipped, unverified = [], 0, False
+        try:
+            bases = pbp_discs(job.path) if job.container == "pbp" else [None]
+            for i, out in enumerate(outs):
+                label = f" disc {i + 1} of {n}" if n > 1 else ""
+                out, force, skip = self.handle_exists(job, out, o)
+                if skip:
+                    skipped += 1
+                    continue
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp.mkdir(parents=True, exist_ok=True)
+                last = [-1]
+
+                def prog(x, label=label):
+                    pct = int(100 * x)
+                    if pct != last[0]:
+                        last[0] = pct
+                        job.status = f"Unpacking{label} {pct}%"
+                        self.post("job", job)
+                        self.post("progress", pct)
+
+                tag = f"{stem} (Disc {i + 1})" if n > 1 else stem
+                self.post("log", f"\n{job.path.name}{label}  [unpacking {job.container.upper()}]", "info")
+                try:
+                    if job.container == "pbp":
+                        cue = unpack_pbp_disc(job.path, bases[i], tmp, tag, prog, lambda: self.stop_flag)
+                    else:
+                        cue = unpack_cdi(job.path, tmp, tag, prog, lambda: self.stop_flag)
+                except UnpackError as e:
+                    if self.stop_flag:
+                        job.status = "Stopped"
+                    else:
+                        job.status, job.result = "Failed (can't unpack)", str(e)
+                        self.post("log", f"{job.path.name}: {e}", "err")
+                    return
+                except OSError as e:
+                    job.status, job.result = "Failed (disk)", str(e)
+                    self.post("log", f"{job.path.name}: {e}", "err")
+                    return
+                cmd = [CHDMAN, "createcd", "-i", str(cue), "-o", str(out)] + (["-f"] if force else []) + self.common_args(o, "CD")
+                job.out_path = out
+                self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+                rc = self.run_proc(cmd, job, "Compressing")
+                if self.stop_flag or rc != 0:
+                    job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+                    if out.exists():
+                        try:
+                            out.unlink()
+                        except OSError:
+                            pass
+                    return
+                if o["verify_after"] or o["delete_src"]:
+                    self.post("log", "Verifying…", "info")
+                    _, ok = self.verify_file(out, job, "Verifying")
+                    if ok is False:
+                        job.status = "Verify failed"
+                        self.post("log", f"VERIFY FAILED for {out.name} - the source file was NOT touched.", "err")
+                        return
+                    unverified = unverified or ok is None
+                made.append(out)
+                self.post("log", f"OK  {out.name}", "ok")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not made:
+            return                                  # everything was skipped; handle_exists already said why
+        if n > 1 and len(made) == n:
+            first.with_name(stem + ".m3u").write_text("".join(p.name + "\n" for p in made), "utf-8")
+        job.out_size = sum(p.stat().st_size for p in made)
+        job.status = "Done"
+        job.result = f"→ {made[0].name}" if len(made) == 1 else f"→ {len(made)} CHDs" + (" + .m3u" if len(made) == n else "")
+        if skipped:
+            job.result += f" ({skipped} already existed)"
+        self.post("log", f"OK  {job.path.name}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
+        if o["delete_src"] and not skipped and not unverified:
+            if recycle([job.path]):
+                self.post("log", f"Sent {job.path.name} to the Recycle Bin.", "ok")
+            else:
+                self.post("log", "Could not recycle the source file.", "warn")
+        elif o["delete_src"]:
+            self.post("log", "The source file was kept (not everything could be verified, or part of it already existed).", "warn")
+
     def do_convert(self, job, o):
+        if job.container:
+            return self.do_convert_container(job, o)
         if job.missing:
             job.status = "Failed (missing files)"
             self.post("log", f"{job.path.name}: missing {', '.join(job.missing)}", "err")
