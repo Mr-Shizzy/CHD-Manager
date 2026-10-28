@@ -42,7 +42,7 @@ SETTINGS_FILE = HERE / "chd_manager_settings.json"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 CD_MAX_BYTES = 737_280_000          # 80-minute CD: 360,000 sectors * 2048 bytes
-SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".sub", ".m3u"}
+SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".sub", ".m3u", ".cso"}
 UNSUPPORTED_EXTS = {".zip", ".7z", ".rar"}
 CHDMAN = None                        # path to chdman.exe, set at startup
 
@@ -220,6 +220,14 @@ def chd_info(path):
         return "?", 0
     tracks = len(re.findall(r"^\s*TRACK:", text, re.M))
     return _kind_from_tags(text), tracks
+
+
+def chd_probe(path):
+    """(disc kind, [track type per track, e.g. 'MODE2_RAW' or 'AUDIO']) read from 'chdman info -v'."""
+    rc, text = run_capture([CHDMAN, "info", "-v", "-i", str(path)])
+    if rc != 0:
+        return "?", []
+    return _kind_from_tags(text), re.findall(r"^\s*TRACK:\s*\d+\s+TYPE:(\S+)", text, re.M)
 
 
 def _kind_from_tags(text):
@@ -1640,10 +1648,119 @@ def verify_cdi(out_path, cue, progress, stopped):
     return True
 
 
-KIND = {"Extract": "extract", "Verify": "verify", "Recompress": "recompress"}
-FORMAT_LABELS = {"auto": "Automatic (CUE/BIN, GDI or ISO)", "iso": "ISO (data discs)", "split": "CUE/BIN, one BIN per track",
-                 "single": "CUE/BIN, one single BIN", "pbp": "PlayStation PBP (PS1 discs)",
-                 "cdi": "DiscJuggler CDI (experimental)"}
+# ------------------------------------------------------------------ CSO (compressed ISO, used for PSP games)
+def read_cso_header(path):
+    """-> (size of the ISO in bytes, block size, offset shift)"""
+    with open(path, "rb") as f:
+        h = f.read(24)
+    if len(h) < 24 or h[:4] != b"CISO":
+        raise UnpackError("this is not a CSO file (a ZSO or a damaged file?)")
+    _, total, block, ver, shift = struct.unpack("<IQIBB2x", h[4:])
+    if ver > 1 or block < 512 or block & (block - 1) or shift > 8 or not total:
+        raise UnpackError("this CSO uses a version or layout CHD Manager can't read")
+    return total, block, shift
+
+
+def iter_cso(path):
+    """Yield (block count, the ISO bytes of each block) of a CSO, in order."""
+    total, block, shift = read_cso_header(path)
+    n = (total + block - 1) // block
+    with open(path, "rb") as f:
+        f.seek(24)
+        idx = struct.unpack("<%dI" % (n + 1), f.read(4 * (n + 1)))
+        for i in range(n):
+            a, b = idx[i], idx[i + 1]
+            start, end = (a & 0x7FFFFFFF) << shift, (b & 0x7FFFFFFF) << shift
+            if f.tell() != start:
+                f.seek(start)
+            raw = f.read(end - start)
+            need = min(block, total - i * block)
+            try:
+                data = raw[:block] if a & 0x80000000 else zlib.decompressobj(-15).decompress(raw)
+            except zlib.error:
+                data = b""
+            if len(data) < need:
+                raise UnpackError(f"the CSO is damaged (block {i})")
+            yield n, data[:need]
+
+
+def cso_to_iso(src, dst, progress, stopped):
+    done = 0
+    with open(dst, "wb") as g:
+        for n, data in iter_cso(src):
+            g.write(data)
+            done += 1
+            if done % 2048 == 0:
+                progress(done / n)
+                if stopped():
+                    raise UnpackError("stopped")
+    progress(1.0)
+
+
+def iso_to_cso(src, dst, progress, stopped, level=9):
+    """ISO -> CSO version 1: 2048-byte blocks, each raw-deflated (or stored when that doesn't shrink it)."""
+    total, block = os.path.getsize(src), 2048
+    n = (total + block - 1) // block
+    shift = 0
+    while 24 + 4 * (n + 1) + total + n * ((1 << shift) - 1) >= 1 << (31 + shift):   # offsets must fit in 31 bits
+        shift += 1
+    align = 1 << shift
+    index = [0] * (n + 1)
+    pos = 24 + 4 * (n + 1)
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        g.write(struct.pack("<4sIQIBB2x", b"CISO", 24, total, block, 1, shift) + b"\0" * (4 * (n + 1)))
+        for i in range(n + 1):
+            pad = -pos % align
+            if pad:
+                g.write(b"\0" * pad)
+                pos += pad
+            if i == n:
+                index[i] = pos >> shift
+                break
+            data = f.read(block).ljust(block, b"\0")
+            c = zlib.compressobj(level, zlib.DEFLATED, -15)
+            comp = c.compress(data) + c.flush()
+            if len(comp) >= block:
+                index[i] = (pos >> shift) | 0x80000000
+                g.write(data)
+                pos += block
+            else:
+                index[i] = pos >> shift
+                g.write(comp)
+                pos += len(comp)
+            if i % 2048 == 0:
+                progress(i / n)
+                if stopped():
+                    raise UnpackError("stopped")
+        g.seek(24)
+        g.write(struct.pack("<%dI" % (n + 1), *index))
+    progress(1.0)
+
+
+def verify_cso(cso, iso, progress, stopped):
+    """True when the CSO unpacks to exactly this ISO."""
+    done = 0
+    with open(iso, "rb") as f:
+        for n, data in iter_cso(cso):
+            if f.read(len(data)) != data:
+                return False
+            done += 1
+            if done % 2048 == 0:
+                progress(done / n)
+                if stopped():
+                    raise UnpackError("stopped")
+        return f.read(1) == b""
+
+
+# What a row's Action drop-down can offer. 'auto' is for CHDs that hold something else (hard disk, laserdisc, raw).
+TARGET_LABELS = {"chd": "→ CHD", "cue": "→ CUE/BIN", "cue_split": "→ CUE/BIN, one BIN per track",
+                 "cue_single": "→ CUE/BIN, one single BIN", "iso": "→ ISO", "gdi": "→ GDI",
+                 "pbp": "→ PlayStation PBP", "cdi": "→ DiscJuggler CDI (experimental)", "cso": "→ CSO (compressed ISO)",
+                 "verify": "Verify only", "recompress": "Recompress", "auto": "Extract"}
+# how the CHD extraction code names each target
+TARGET_FMT = {"cue": "auto", "cue_split": "split", "cue_single": "single", "iso": "iso", "gdi": "auto", "pbp": "pbp",
+              "cdi": "cdi", "cso": "cso", "auto": "auto"}
+CUE_TYPE = {"AUDIO": "AUDIO", "MODE1/2048": "MODE1", "MODE1/2352": "MODE1_RAW", "MODE2/2352": "MODE2_RAW"}
 
 
 def collections_counter(jobs):
@@ -1677,9 +1794,9 @@ class Job:
         self.path = Path(path)
         self.root = Path(root) if root else None
         self.kind = "convert"          # convert | extract | verify | recompress
-        self.task_override = None      # per-item choice for a CHD: "Extract" | "Verify" | "Recompress"
-        self.fmt = None                # per-item output format for a CHD (a FORMAT_LABELS key); None = the Settings default
-        self.can_pick = False          # the Action cell offers a drop-down of choices
+        self.home = self.path          # the file the user added; outputs are named after it even while a temp copy is worked on
+        self.target = None             # what this row becomes: a key of TARGET_LABELS (chosen in the Action drop-down)
+        self.types = []                # track types in CHD style: AUDIO, MODE1, MODE1_RAW, MODE2_RAW (empty = unknown)
         self.action_text = ""
         self.override = "Auto"         # Auto | CD | DVD
         self.auto_type, self.reason = "CD", ""
@@ -1702,14 +1819,78 @@ class Job:
     def type(self):
         return self.override if self.override != "Auto" else self.auto_type
 
-    def analyze(self, chd_action="Extract"):
+    def set_target(self, target):
+        self.target = target
+        self.kind = {"chd": "convert", "verify": "verify", "recompress": "recompress"}.get(target, "extract")
+
+    def default_target(self):
+        t = [k for k, _ in self.available_targets()]
+        if self.path.suffix.lower() == ".chd":
+            return next((k for k in ("cue_split", "cue", "gdi", "iso", "auto") if k in t), "verify")
+        return t[0] if t else "chd"
+
+    def available_targets(self):
+        """[(key, label)] of everything this item can safely become. Nothing is offered that is known not to work."""
+        ext, ty = self.path.suffix.lower(), self.types
+        data = [x for x in ty if x != "AUDIO"]
+        single = len(ty) == 1 and ty[0].startswith("MODE")
+        raw = bool(data) and all(x.endswith("_RAW") for x in data)
+        keys = []
+        if ext == ".chd":
+            if self.disc == "CD":
+                keys += ["cue"] if len(ty) <= 1 else ["cue_split", "cue_single"]
+                if single:
+                    keys += ["iso", "cso"]
+                if raw and data[0].startswith("MODE2"):
+                    keys.append("pbp")
+                if raw:
+                    keys.append("cdi")
+            elif self.disc == "GD-ROM":
+                keys.append("gdi")
+            elif self.disc == "DVD":
+                keys += ["iso", "cso"]
+            else:
+                keys.append("auto")
+            keys.append("verify")
+            if self.disc in ("CD", "GD-ROM", "DVD"):
+                keys.append("recompress")
+        elif ext == ".m3u":
+            keys.append("pbp")
+        else:
+            keys.append("chd")
+            if ty and self.container in ("pbp", "cdi", "image"):
+                keys.append("cue")
+            if ty and self.disc_count == 1:
+                if single:
+                    keys += [k for k, skip in (("iso", ".iso"), ("cso", ".cso")) if ext != skip]
+                if raw and self.container != "cso":
+                    if self.platform == "PS1" and ext != ".pbp":
+                        keys.append("pbp")
+                    if ext != ".cdi":
+                        keys.append("cdi")
+        return [(k, TARGET_LABELS[k]) for k in dict.fromkeys(keys)]
+
+    @property
+    def can_pick(self):
+        return len(self.available_targets()) > 1
+
+    def analyze(self, _=None):
+        self._analyze()
+        if self.target not in [k for k, _ in self.available_targets()]:
+            self.set_target(self.default_target())
+
+    def _analyze(self):
         p, ext = self.path, self.path.suffix.lower()
         if ext == ".chd":
-            self.kind = KIND.get(self.task_override or chd_action, "extract")
             self.size = p.stat().st_size
-            self.disc, self.tracks = chd_info(p) if CHDMAN else ("?", 0)
+            self.disc, self.types = chd_probe(p) if CHDMAN else ("?", [])
+            self.tracks = len(self.types)
             self.src_files = [p]
-            self.can_pick = True
+            return
+        if ext == ".cso":
+            total = read_cso_header(p)[0]
+            self.size, self.src_files, self.container, self.types = p.stat().st_size, [p], "cso", ["MODE1"]
+            self.auto_type, self.reason = decide_type(".iso", total, "")
             return
         if ext == ".m3u":
             lines = [ln.strip() for ln in p.read_text("utf-8-sig", "replace").splitlines() if ln.strip() and not ln.startswith("#")]
@@ -1717,14 +1898,15 @@ class Job:
             bad = [c.name for c in self.m3u_chds if c.suffix.lower() != ".chd" or not c.is_file()]
             if not self.m3u_chds or bad or len(self.m3u_chds) > 5:
                 raise ValueError("a playlist must list 1-5 existing .chd files" + (f" (problem: {', '.join(bad[:2])})" if bad else ""))
-            self.kind, self.disc, self.platform, self.disc_count = "extract", "CD", "PS1", len(self.m3u_chds)
+            self.disc, self.platform, self.disc_count = "CD", "PS1", len(self.m3u_chds)
             self.src_files = [p] + self.m3u_chds
             self.size = sum(f.stat().st_size for f in self.src_files)
             return
         if ext in IMAGE_EXTS:
             tracks = read_image(p)
             self.container = "image"
-            self.can_pick = True
+            self.types = ["AUDIO" if t["kind"] == "AUDIO" else "MODE1" if t["kind"] == "MODE1" and t["stride"] == 2048 else
+                          f"{t['kind']}_RAW" for t in tracks]
             self.src_files = image_sources(p, tracks)
             self.size = sum(f.stat().st_size for f in self.src_files)
             self.platform = image_platform(tracks)
@@ -1732,14 +1914,17 @@ class Job:
             return
         if ext in (".pbp", ".cdi"):
             self.container = ext[1:]
-            self.can_pick = True
             self.size = p.stat().st_size
             self.src_files = [p]
             if ext == ".pbp":
                 self.disc_count = len(pbp_discs(p))
                 self.platform = "PS1"
-            elif any(t["session"] > 1 and t["mode"] == 2 for t in parse_cdi(p)):
-                self.platform = "Dreamcast"
+                self.types = ["MODE2_RAW", "AUDIO"]       # a PBP may hold audio tracks, so no ISO/CSO is offered for it
+            else:
+                cdi = parse_cdi(p)
+                self.types = ["AUDIO" if t["mode"] == 0 else f"MODE{t['mode']}_RAW" for t in cdi]
+                if any(t["session"] > 1 and t["mode"] == 2 for t in cdi):
+                    self.platform = "Dreamcast"
             self.auto_type, self.reason = decide_type(ext, self.size, self.platform)
             return
         if ext == ".cue":
@@ -1764,20 +1949,24 @@ class Job:
         elif first:
             self.platform = sniff_platform(first)
         self.auto_type, self.reason = decide_type(ext, data_size, self.platform)
+        if ext == ".iso":
+            self.types = ["MODE1"]
+        elif ext == ".cue":
+            ty = [CUE_TYPE.get(t) for _, t in parse_cue_tracks(p)]
+            self.types = ty if ty and None not in ty else []
         if self.lone_bin:
             self.reason += " (BIN without a CUE)"
         if self.missing:
             self.status = "Missing: " + ", ".join(self.missing[:2])
 
     def action_label(self):
-        text = self.action_text or {"convert": "→ CHD", "extract": "Extract", "verify": "Verify", "recompress": "Recompress",
-                                    "unpack": "→ CUE/BIN"}[self.kind]
+        text = self.action_text or TARGET_LABELS.get(self.target, "")
         return text + "  ▾" if self.can_pick and not self.status.startswith("Done") else text
 
     def type_label(self):
         if self.kind == "convert":
             return self.type + ("*" if self.override != "Auto" else "")
-        return self.disc
+        return self.disc or self.type
 
     def row(self):
         return (self.path.name, self.action_label(), self.platform, self.type_label(),
@@ -1788,7 +1977,7 @@ class Job:
 DEFAULTS = {
     "chdman": "", "compression": "Default", "custom_comp": "", "hunk": "", "threads": 0,
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
-    "chd_action": "Extract", "extract_format": "auto", "split_bin": False, "extract_subfolder": False,
+    "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
     "base_pbp": "", "base_pbp_ask": True, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
@@ -1876,17 +2065,6 @@ class App:
         btn("Clear all", self.clear_all)
         self.more_btn = ttk.Button(bar, text="More  ▾", command=self.show_more_menu)
         self.more_btn.pack(side="right")
-        self.chd_ctl = ttk.Frame(bar)
-        ttk.Label(self.chd_ctl, text="CHD files:", style="Muted.TLabel").pack(side="left", padx=(0, 6))
-        self.chd_act_cb = ttk.Combobox(self.chd_ctl, state="readonly", width=11, textvariable=self.v["chd_action"],
-                                       values=["Extract", "Verify", "Recompress"])
-        self.chd_act_cb.pack(side="left")
-        self.fmt_disp = tk.StringVar()
-        self.chd_fmt_cb = ttk.Combobox(self.chd_ctl, state="readonly", width=28, textvariable=self.fmt_disp,
-                                       values=list(FORMAT_LABELS.values()))
-        self.chd_fmt_cb.bind("<<ComboboxSelected>>", self.on_format_selected)
-        self.v["extract_format"].trace_add("write", lambda *a: (self.sync_fmt_disp(), self.update_action_labels()))
-
         self.more_menu = tk.Menu(root, tearoff=0)
         self.more_menu.add_command(label="Settings…", command=lambda: self.open_settings("Convert"))
         self.more_menu.add_separator()
@@ -1949,7 +2127,7 @@ class App:
         cols = ("file", "action", "platform", "type", "size", "status", "result", "folder")
         self.tree = ttk.Treeview(top, columns=cols, displaycolumns=("file", "action", "platform", "type", "size", "status", "result"),
                                  show="headings", selectmode="extended")
-        for c, t, w, a in (("file", "File", 240, "w"), ("action", "Action", 150, "w"), ("platform", "Platform", 100, "w"),
+        for c, t, w, a in (("file", "File", 240, "w"), ("action", "Action  ▾", 150, "w"), ("platform", "Platform", 100, "w"),
                            ("type", "Disc type", 90, "w"), ("size", "Size", 90, "e"), ("status", "Status", 150, "w"),
                            ("result", "Result", 230, "w"), ("folder", "Folder", 300, "w")):
             self.tree.heading(c, text=t)
@@ -1964,8 +2142,8 @@ class App:
         top.columnconfigure(0, weight=1)
         self.empty = ttk.Label(top, justify="center", style="Empty.TLabel", font=("Segoe UI", 12),
                                text="Drag files or folders here, or use “Add Files” / “Add Folder”\n\n"
-                                    ".cue / .gdi / .iso / .toc  →  CHD (CD or DVD chosen for you)\n"
-                                    ".chd  →  extract or verify")
+                                    "Then choose what each one becomes in its Action column.\n"
+                                    "CHD, CUE/BIN, GDI, ISO, CSO, PBP and CDI, plus MDS, NRG and CCD/IMG as sources")
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
         self.picker, self.manual_cols, self.auto_w, self.tip, self.tip_after, self.tip_cell = None, set(), {}, None, None, None
         self.tree.bind("<Double-1>", self.on_tree_double)
@@ -1985,10 +2163,6 @@ class App:
         self.menu.add_command(label="Disc type: force DVD", command=lambda: self.set_override("DVD"))
         self.menu.add_separator()
         self.menu.add_command(label="Info…", command=self.info_selected)
-        self.menu.add_separator()
-        self.menu.add_command(label="This CHD: extract it", command=lambda: self.set_item_action("Extract"))
-        self.menu.add_command(label="This CHD: verify only", command=lambda: self.set_item_action("Verify"))
-        self.menu.add_command(label="This CHD: recompress it", command=lambda: self.set_item_action("Recompress"))
         self.menu.add_separator()
         self.menu.add_command(label="Open folder", command=self.open_selected_folder)
         self.menu.add_separator()
@@ -2095,31 +2269,24 @@ class App:
         ttk.Checkbutton(f, text="Auto-create a CUE for a lone .bin (assumes MODE2/2352, typical PS1)",
                         variable=v["auto_cue"]).grid(row=6, column=0, columnspan=2, sticky="w")
 
-        # --- CHD files
-        f = tab("CHD files")
-        row(f, 0, "What to do with .chd files", ttk.Combobox(f, textvariable=v["chd_action"], width=12, state="readonly",
-                                                              values=["Extract", "Verify", "Recompress"]))
-        ttk.Label(f, text="When extracting, make:").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 2))
-        for i, (key, label) in enumerate(FORMAT_LABELS.items()):
-            ttk.Radiobutton(f, text=label, variable=v["extract_format"], value=key).grid(
-                row=2 + i, column=0, columnspan=2, sticky="w", padx=(14, 0))
-        ttk.Checkbutton(f, text="Always use a subfolder (discs with several files get one automatically)", variable=v["extract_subfolder"]).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        # --- Formats (what each file becomes is chosen in its Action column; this tab only holds the extras)
+        f = tab("Formats")
+        ttk.Checkbutton(f, text="Always put converted discs in a subfolder (discs with several files get one automatically)",
+                        variable=v["extract_subfolder"]).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
-                  text="Automatic reads the CHD: CD discs become .cue + .bin (one BIN per track when the disc has more than one track), Dreamcast GD-ROM discs become .gdi, DVD discs become .iso. "
-                       "ISO works for data discs with a single track and refuses audio or multi-track discs rather than lose data. "
-                       "PBP is for PlayStation 1 discs: with a base PBP (below) it can also run on a PSP with custom firmware, without one it works in emulators and frontends that read PBP; "
-                       "to make one PBP from a multi-disc game, add the game's .m3u playlist instead of the separate CHDs. "
-                       "CDI (DiscJuggler) is for CD discs, mainly Dreamcast; it is new and has been checked by reading it back and in an emulator, not in DiscJuggler itself. "
+                  text="Pick what each file becomes in the Action column of the list. Only choices that can work for that file are offered. "
+                       "A PBP is for PlayStation 1 discs: with a base PBP (below) it can also run on a PSP with custom firmware, without one it works in "
+                       "emulators and frontends that read PBP; to make one PBP from a multi-disc game, add the game's .m3u playlist. "
+                       "CDI (DiscJuggler) is new and has been checked by reading it back and in an emulator, not in DiscJuggler itself. "
+                       "CSO is the compressed ISO format used for PSP games. "
                        "Recompress writes a new CHD with the Convert page's compression and hunk size; your original is kept.").grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=10)
+            row=1, column=0, columnspan=2, sticky="w", pady=10)
         bf = ttk.Frame(f)
-        bf.grid(row=11, column=0, columnspan=2, sticky="w")
+        bf.grid(row=2, column=0, columnspan=2, sticky="w")
         ttk.Label(bf, text="Base PBP for real PSP/Vita (optional):").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Entry(bf, textvariable=v["base_pbp"], width=44).grid(row=1, column=0)
         ttk.Button(bf, text="Browse…", command=self.pick_base_pbp).grid(row=1, column=1, padx=4)
         ttk.Button(bf, text="Download…", command=self.download_base_pbp_ui).grid(row=1, column=2)
-        v["chd_action"].trace_add("write", lambda *a: self.apply_chd_action())
 
         # --- Output
         f = tab("Output")
@@ -2470,59 +2637,40 @@ class App:
         else:
             self.check_app_update_async(True)
 
-    # ------------------------------------------------------------------ what to do with CHD files
-    def sync_fmt_disp(self):
-        self.fmt_disp.set(FORMAT_LABELS.get(self.v["extract_format"].get(), FORMAT_LABELS["auto"]))
-
-    def on_format_selected(self, event=None):
-        back = {label: key for key, label in FORMAT_LABELS.items()}
-        self.v["extract_format"].set(back.get(self.fmt_disp.get(), "auto"))
-
+    # ------------------------------------------------------------------ what each file becomes (its Action drop-down)
     def refresh_chd_controls(self):
-        """The 'CHD files:' choices only appear when there is a CHD in the list, since that is the only
-        case where the app can't know what you want."""
-        has_chd = any(j.path.suffix.lower() in (".chd", ".m3u") for j in self.jobs)
-        if has_chd and not self.chd_ctl.winfo_manager():
-            self.chd_ctl.pack(side="right", padx=(0, 12))
-        elif not has_chd and self.chd_ctl.winfo_manager():
-            self.chd_ctl.pack_forget()
-        extracting = self.v["chd_action"].get() == "Extract"
-        if extracting and not self.chd_fmt_cb.winfo_manager():
-            self.chd_fmt_cb.pack(side="left", padx=(8, 0))
-        elif not extracting and self.chd_fmt_cb.winfo_manager():
-            self.chd_fmt_cb.pack_forget()
-        self.sync_fmt_disp()
         self.root.after(50, self.fit_toolbar)
 
     def fmt_for(self, job, o=None):
-        """The output format for a CHD: this row's own choice, else the one in Settings."""
-        if job.path.suffix.lower() == ".m3u":
-            return "pbp"                      # a playlist can only become a PBP
-        return job.fmt or ((o or {}).get("extract_format") if o else self.v["extract_format"].get())
+        """How the CHD extraction code names this row's target."""
+        return TARGET_FMT.get(job.target, "auto")
 
     def action_choices(self, job):
-        """[(label, task, fmt)] offered in the Action drop-down of one row. Only things that can work for this item."""
-        if job.path.suffix.lower() == ".chd":
-            ex = {"CD": [("→ CUE/BIN (automatic)", "auto"), ("→ CUE/BIN, one BIN per track", "split"),
-                         ("→ CUE/BIN, one single BIN", "single"), ("→ ISO (data discs)", "iso"),
-                         ("→ PlayStation PBP (PS1 discs)", "pbp"), ("→ DiscJuggler CDI (experimental)", "cdi")],
-                  "GD-ROM": [("→ GDI", "auto")], "DVD": [("→ ISO", "auto")]}.get(job.disc, [("Extract", "auto")])
-            return ([("Default (from Settings)", None, None)] + [(lab, "Extract", f) for lab, f in ex]
-                    + [("Verify only", "Verify", None), ("Recompress", "Recompress", None)])
-        if job.container:
-            return [("→ CHD", "convert", None), ("→ CUE/BIN files only (no CHD)", "unpack", None)]
-        return []
+        """[(label, target key)] offered in the Action drop-down of one row: only what can work for that item."""
+        return [(label, key) for key, label in job.available_targets()]
 
     def pick_action(self, job, choice):
-        _, task, fmt = choice
-        if job.path.suffix.lower() == ".chd":
-            job.task_override, job.fmt = task, fmt
-            job.kind = KIND[task] if task else KIND.get(self.v["chd_action"].get(), "extract")
-        else:
-            job.kind = task
+        job.set_target(choice[1])
         self.close_picker()
         self.update_action_labels()
         self.update_status_idle()
+
+    GENERIC_TARGETS = (("chd", "→ CHD"), ("cue", "→ CUE/BIN"), ("iso", "→ ISO"), ("pbp", "→ PlayStation PBP"),
+                       ("cdi", "→ DiscJuggler CDI"), ("cso", "→ CSO"), ("verify", "Verify (CHD files)"),
+                       ("recompress", "Recompress (CHD files)"))
+
+    def set_all_targets(self, key, label):
+        """From the Action heading: give every file that can do it the same target; the rest keep their own."""
+        done = 0
+        for j in self.jobs:
+            have = [k for k, _ in j.available_targets()]
+            pick = next((k for k in (("cue", "cue_split") if key == "cue" else (key,)) if k in have), None)
+            if pick and not j.status.startswith("Done"):
+                j.set_target(pick)
+                done += 1
+        self.update_action_labels()
+        self.update_status_idle()
+        self.status.config(text=f"{done} of {len(self.jobs)} item(s) set to “{label}”; the others can't do that and keep their own choice.")
 
     def close_picker(self):
         pk = getattr(self, "picker", None)
@@ -2568,7 +2716,14 @@ class App:
 
     def on_tree_press(self, e):
         self.close_picker()
-        self.sep_drag = self.tree.identify_region(e.x, e.y) == "separator"
+        region = self.tree.identify_region(e.x, e.y)
+        if region == "heading" and self.tree.identify_column(e.x) == "#2" and self.jobs and not self.running:
+            m = tk.Menu(self.root, tearoff=0)
+            m.add_command(label="Set every file that can, to:", state="disabled")
+            for key, label in self.GENERIC_TARGETS:
+                m.add_command(label=label, command=lambda k=key, lab=label: self.set_all_targets(k, lab))
+            m.tk_popup(e.x_root, e.y_root)
+        self.sep_drag = region == "separator"
         self.press_w = {c: self.tree.column(c, "width") for c in self.tree["displaycolumns"]}
 
     def on_tree_double(self, e):
@@ -2649,34 +2804,14 @@ class App:
             pass
 
     def wants_split(self, job, o=None):
-        """One BIN per track: forced by the user, or automatically when a CD has more than one track."""
+        """One BIN per track: chosen in the Action drop-down."""
         fmt = self.fmt_for(job, o)
-        split_opt = (o or {}).get("split_bin") if o else self.v["split_bin"].get()
-        if fmt == "single":
-            return False
-        return bool(split_opt) or fmt == "split" or (fmt == "auto" and job.tracks > 1)
+        return fmt == "split" or (fmt == "auto" and job.tracks > 1 and job.target != "cue_single")
 
     def action_text_for(self, job):
-        if job.kind == "convert":
-            return f"→ {job.disc_count} CHDs" if job.disc_count > 1 else "→ CHD"
-        if job.kind == "unpack":
-            return "→ CUE/BIN"
-        if job.kind == "verify":
-            return "Verify"
-        if job.kind == "recompress":
-            return "Recompress"
-        fmt = self.fmt_for(job)
-        if job.path.suffix.lower() == ".m3u" or (fmt == "pbp" and job.disc == "CD"):
-            return "→ PBP"
-        if fmt == "cdi" and job.disc == "CD":
-            return "→ CDI"
-        if job.disc == "GD-ROM":
-            return "→ GDI"
-        if job.disc == "DVD":
-            return "→ ISO"
-        if job.disc == "CD":
-            return "→ ISO" if fmt == "iso" else "→ CUE/BIN (per track)" if self.wants_split(job) else "→ CUE/BIN"
-        return "Extract"
+        if job.target == "chd" and job.disc_count > 1:
+            return f"→ {job.disc_count} CHDs"
+        return TARGET_LABELS.get(job.target, "Extract")
 
     def update_action_labels(self):
         for j in self.jobs:
@@ -2686,28 +2821,11 @@ class App:
         self.root.after_idle(self.autofit_columns)
 
     def plan_text(self):
-        c = collections_counter(self.jobs)
-        parts = []
-        if c.get("convert"):
-            parts.append(f"{c['convert']} disc image(s) → CHD")
-        if c.get("unpack"):
-            parts.append(f"{c['unpack']} disc image(s) → CUE/BIN")
-        if c.get("extract"):
-            parts.append(f"{c['extract']} CHD file(s) → extract")
-        if c.get("verify"):
-            parts.append(f"{c['verify']} CHD file(s) → verify")
-        if c.get("recompress"):
-            parts.append(f"{c['recompress']} CHD file(s) → recompress")
-        return "  ·  ".join(parts)
-
-    def set_item_action(self, action):
-        """Per-item override from the right-click menu."""
-        for j in self.selected_jobs():
-            if j.path.suffix.lower() == ".chd" and not j.status.startswith("Done"):
-                j.task_override = action
-                j.kind = KIND[action]
-        self.update_action_labels()
-        self.update_status_idle()
+        c = {}
+        for j in self.jobs:
+            lab = TARGET_LABELS.get(j.target, "")
+            c[lab] = c.get(lab, 0) + 1
+        return "  ·  ".join(f"{n} {lab}" for lab, n in c.items())
 
     def theme_menu_label(self):
         return "Switch to the light theme" if self.v["theme"].get() == "dark" else "Switch to the dark theme"
@@ -2877,7 +2995,7 @@ class App:
                 continue
             try:
                 job = Job(f, root)
-                job.analyze(self.v["chd_action"].get())
+                job.analyze()
             except Exception as e:  # noqa: BLE001
                 self.log(f"Could not read {f.name}: {e}", "err")
                 continue
@@ -2892,10 +3010,8 @@ class App:
         self.log(f"Added {added} item(s).", "info")
         self.update_action_labels()
         self.update_status_idle()
-        if added and any(j.path.suffix.lower() == ".chd" for j in self.jobs):
-            self.log("CHD files will be " + {"Extract": "extracted", "Verify": "verified", "Recompress": "recompressed"}.get(
-                self.v["chd_action"].get(), "extracted") + ". Change this with the 'CHD files' choice at the top "
-                     "(or right-click a file).", "info")
+        if added:
+            self.log("Click the Action cell of a file to choose what it becomes; click the Action heading to set them all.", "info")
         if added:
             self.refresh_suggestions(first_add=was_empty)
 
@@ -2940,14 +3056,6 @@ class App:
             total = sum(j.size for j in self.jobs)
             plan = self.plan_text()
             self.status.config(text=(f"{n} item(s), {fmt_size(total)}" + (f"   ·   {plan}" if plan else "")) if n else "Ready")
-
-    def apply_chd_action(self):
-        act = self.v["chd_action"].get()
-        for j in self.jobs:
-            if j.path.suffix.lower() == ".chd" and j.status in ("Queued",) and not j.task_override:
-                j.kind = KIND.get(act, "extract")
-        self.update_action_labels()
-        self.update_status_idle()
 
     def set_override(self, val):
         for j in self.selected_jobs():
@@ -3016,11 +3124,10 @@ class App:
                      "but can download a generic PBP that has one from the public GitHub repository julianxhokaxhiu/iPoPS "
                      "(two files, about 1.4 MB, each checked against a fixed checksum) and keep it next to CHD Manager.exe as BASE.PBP and DATA.PSP. "
                      "It is only used to copy the loader, icon and boot logo into the PBPs you make. "
-                     "You can also choose any working PlayStation 1 .pbp of your own in Settings, CHD files.")
+                     "You can also choose any working PlayStation 1 .pbp of your own in Settings, Formats.")
 
     def pbp_jobs(self, todo):
-        return any(j.kind == "extract" and (j.path.suffix.lower() == ".m3u" or (self.fmt_for(j) == "pbp" and j.disc == "CD"))
-                   for j in todo)
+        return any(j.target == "pbp" for j in todo)
 
     def offer_base_pbp(self):
         """Before making PBPs without a base: offer the download once. False = don't start."""
@@ -3130,7 +3237,7 @@ class App:
             started = time.time()
             try:
                 {"convert": self.do_convert, "extract": self.do_extract, "verify": self.do_verify,
-                 "recompress": self.do_recompress, "unpack": self.do_unpack}[job.kind](job, o)
+                 "recompress": self.do_recompress}[job.kind](job, o)
             except Exception:  # noqa: BLE001
                 job.status = "Error"
                 self.post("log", traceback.format_exc(), "err")
@@ -3159,16 +3266,16 @@ class App:
         self.post("finish", msg, stats["fail"] == 0)
 
     def output_path(self, job, o, ext, multi=False):
-        stem = job.path.stem
+        stem = job.home.stem
         if o["out_mode"] == "custom" and o["out_dir"]:
             base = Path(o["out_dir"])
             if o["keep_structure"] and job.root:
                 try:
-                    base = base / job.path.parent.relative_to(job.root)
+                    base = base / job.home.parent.relative_to(job.root)
                 except ValueError:
                     pass
         else:
-            base = job.path.parent
+            base = job.home.parent
         if job.kind == "extract" and (multi or o["extract_subfolder"]):
             base = base / stem
         base.mkdir(parents=True, exist_ok=True)
@@ -3224,6 +3331,10 @@ class App:
             return unpack_pbp_disc(job.path, base, outdir, tag, prog, stopped)
         if job.container == "image":
             return unpack_tracks(read_image(job.path), outdir, tag, prog, stopped, iso_ok=iso_ok)
+        if job.container == "cso":
+            iso = Path(outdir) / f"{tag}.iso"
+            cso_to_iso(job.path, iso, prog, stopped)
+            return iso
         return unpack_cdi(job.path, outdir, tag, prog, stopped)
 
     def do_unpack(self, job, o):
@@ -3453,6 +3564,8 @@ class App:
             self.post("log", f"{job.path.name} FAILED verification.", "err")
 
     def do_extract(self, job, o):
+        if job.path.suffix.lower() not in (".chd", ".m3u"):
+            return self.export_other(job, o)
         if job.disc in ("", "?"):
             job.disc, job.tracks = chd_info(job.path)
         kind = job.disc
@@ -3465,6 +3578,8 @@ class App:
             self.post("log", f"{job.path.name}: cannot read this CHD.", "err")
             return
         fmt = self.fmt_for(job, o)
+        if fmt == "cso":
+            return self.extract_to_cso(job, o)
         if fmt == "pbp" or job.path.suffix.lower() == ".m3u":
             if fmt != "pbp":
                 job.status, job.result = "Failed (choose PBP)", "A playlist can only be combined into a PBP: choose PlayStation PBP under 'CHD files'."
@@ -3508,6 +3623,181 @@ class App:
         job.status = "Done"
         job.result = f"→ {out.name}"
         self.post("log", f"OK  {out}", "ok")
+
+    # ---- sources other than a CHD that become something other than a CHD
+    def export_other(self, job, o):
+        """A disc image / PBP / CDI / CSO whose target isn't a CHD. Where a direct route exists it is used; every other
+        combination goes through a temporary uncompressed CHD, so each target is written by the same code whatever the source."""
+        t = job.target
+        if t == "cue" and job.container in ("pbp", "cdi", "image"):
+            return self.do_unpack(job, o)
+        if t == "cso" and job.path.suffix.lower() == ".iso":
+            return self.do_iso_to_cso(job, o)
+        if t == "iso" and job.container == "cso":
+            return self.do_cso_to_iso(job, o)
+        return self.export_via_chd(job, o)
+
+    def export_via_chd(self, job, o):
+        tmp = self.output_path(job, o, ".x").parent / f".{job.home.stem[:40]}.chdm_hub"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        saved = (job.path, job.disc, job.tracks)
+        try:
+            tchd = tmp / (job.home.stem + ".chd")
+            if not self.chd_from_source(job, o, tchd, tmp):
+                return
+            job.path = tchd
+            job.disc, job.tracks = chd_info(tchd)
+            self.do_extract(job, o)
+        finally:
+            job.path, job.disc, job.tracks = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def chd_from_source(self, job, o, tchd, tmp):
+        """Any non-CHD source -> an uncompressed CHD at tchd. False (with the job's status set) when that fails."""
+        src, typ = job.path, job.type
+        if job.missing:
+            job.status = "Failed (missing files)"
+            self.post("log", f"{job.path.name}: missing {', '.join(job.missing)}", "err")
+            return False
+        if job.container:
+            last = [-1]
+
+            def prog(x):
+                pct = int(100 * x)
+                if pct != last[0]:
+                    last[0] = pct
+                    job.status = f"Unpacking {pct}%"
+                    self.post("job", job)
+                    self.post("progress", pct)
+
+            unp = tmp / "unp"
+            unp.mkdir()
+            self.post("log", f"\n{job.path.name}  [unpacking {job.path.suffix[1:].upper()}]", "info")
+            try:
+                base = pbp_discs(job.path)[0] if job.container == "pbp" else None
+                src = self.unpack_job(job, base, unp, job.home.stem, prog, iso_ok=True)
+            except UnpackError as e:
+                if self.stop_flag:
+                    job.status = "Stopped"
+                else:
+                    job.status, job.result = "Failed (can't unpack)", str(e)
+                    self.post("log", f"{job.path.name}: {e}", "err")
+                return False
+            except OSError as e:
+                job.status, job.result = "Failed (disk)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+                return False
+            typ = "DVD" if src.suffix.lower() == ".iso" else "CD"
+        cmd = [CHDMAN, "createdvd" if typ == "DVD" and self.has_dvd else "createcd", "-i", str(src), "-o", str(tchd), "-c", "none"]
+        self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+        rc = self.run_proc(cmd, job, "Preparing")
+        if self.stop_flag or rc != 0:
+            job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+            return False
+        return True
+
+    def cso_progress(self, job, label):
+        last = [-1]
+
+        def prog(x):
+            pct = int(100 * x)
+            if pct != last[0]:
+                last[0] = pct
+                job.status = f"{label} {pct}%"
+                self.post("job", job)
+                self.post("progress", pct)
+        return prog
+
+    def write_cso_file(self, job, o, iso, part, out):
+        """iso -> part (a CSO), compared against the ISO when verifying is on, then moved to out. True on success."""
+        try:
+            iso_to_cso(iso, part, self.cso_progress(job, "Compressing"), lambda: self.stop_flag)
+            if o["verify_after"] and not verify_cso(part, iso, self.cso_progress(job, "Verifying"), lambda: self.stop_flag):
+                job.status, job.result = "Verify failed", "the finished CSO didn't match the ISO it was made from; it was discarded."
+                self.post("log", f"{job.path.name}: {job.result}", "err")
+                return False
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't write)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+            return False
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+            return False
+        os.replace(part, out)
+        job.out_path, job.out_size = out, out.stat().st_size
+        job.status, job.result = "Done", f"→ {out.name}"
+        self.post("log", f"OK  {out}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
+        return True
+
+    def do_iso_to_cso(self, job, o):
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".cso"), o)
+        if skip:
+            return
+        part = out.with_name(out.name + ".part")
+        self.post("log", f"\n{job.path.name}  [ISO → CSO]", "info")
+        try:
+            self.write_cso_file(job, o, job.path, part, out)
+        finally:
+            part.unlink(missing_ok=True)
+
+    def do_cso_to_iso(self, job, o):
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".iso"), o)
+        if skip:
+            return
+        part = out.with_name(out.name + ".part")
+        self.post("log", f"\n{job.path.name}  [CSO → ISO]", "info")
+        try:
+            cso_to_iso(job.path, part, self.cso_progress(job, "Unpacking"), lambda: self.stop_flag)
+            if o["verify_after"] and not verify_cso(job.path, part, self.cso_progress(job, "Verifying"), lambda: self.stop_flag):
+                job.status, job.result = "Verify failed", "the unpacked ISO didn't match the CSO; it was discarded."
+                self.post("log", f"{job.path.name}: {job.result}", "err")
+                return
+            os.replace(part, out)
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't unpack)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        finally:
+            part.unlink(missing_ok=True)
+        job.out_path, job.out_size = out, out.stat().st_size
+        job.status, job.result = "Done", f"→ {out.name}"
+        self.post("log", f"OK  {out}", "ok")
+
+    def extract_to_cso(self, job, o):
+        """CHD -> CSO: a DVD CHD or a single-data-track CD CHD, through an ISO."""
+        if job.disc != "DVD":
+            return self.extract_to_iso(job, o, to_cso=True)
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".cso"), o)
+        if skip:
+            return
+        tmp = out.parent / f".{out.stem[:40]}.chdm_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            iso = tmp / "t.iso"
+            cmd = [CHDMAN, "extractdvd", "-i", str(job.path), "-o", str(iso), "-f"]
+            self.post("log", f"\n{job.path.name}  [DVD → CSO]", "info")
+            self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+            rc = self.run_proc(cmd, job, "Extracting")
+            if self.stop_flag or rc != 0:
+                job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+                return
+            self.write_cso_file(job, o, iso, out.with_name(out.name + ".part"), out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            out.with_name(out.name + ".part").unlink(missing_ok=True)
 
     def extract_to_pbp(self, job, o):
         """CD CHD (or an .m3u playlist of CHDs, one per disc) -> one .pbp. PlayStation 1 discs only."""
@@ -3567,7 +3857,7 @@ class App:
                 except (UnpackError, OSError) as e:
                     self.post("log", f"The base PBP wasn't used: {e}", "warn")
             self.post("log", f"Using base PBP {Path(o['base_pbp_file']).name} (loader, icon and boot logo for a PSP/Vita)." if donor else
-                      "No base PBP: this PBP works in emulators and frontends, but a PSP/Vita needs one (Settings, CHD files).",
+                      "No base PBP: this PBP works in emulators and frontends, but a PSP/Vita needs one (Settings, Formats).",
                       "info" if donor else "warn")
             title = re.sub(r"\s*\((?:disc|cd)\s*\d+\)", "", out.stem, flags=re.I)
             title = re.sub(r"\s*\[[^\]]*\]", "", title).strip() or out.stem
@@ -3654,9 +3944,9 @@ class App:
                 except OSError:
                     pass
 
-    def extract_to_iso(self, job, o):
-        """CD CHD -> .iso. Only possible when the disc is one MODE1 data track; anything else would lose data."""
-        out = self.output_path(job, o, ".iso")
+    def extract_to_iso(self, job, o, to_cso=False):
+        """CD CHD -> .iso (or .cso). Only possible when the disc is one data track; anything else would lose data."""
+        out = self.output_path(job, o, ".cso" if to_cso else ".iso")
         out, force, skip = self.handle_exists(job, out, o)
         if skip:
             return
@@ -3667,7 +3957,7 @@ class App:
             cue = tmp / "t.cue"
             cmd = [CHDMAN, "extractcd", "-i", str(job.path), "-o", str(cue), "-f"]
             job.out_path = out
-            self.post("log", f"\n{job.path.name}  [CD → ISO]", "info")
+            self.post("log", f"\n{job.path.name}  [CD → {'CSO' if to_cso else 'ISO'}]", "info")
             self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
             rc = self.run_proc(cmd, job, "Extracting")
             if self.stop_flag or rc != 0:
@@ -3717,6 +4007,9 @@ class App:
             if self.stop_flag:
                 job.status = "Stopped"
                 return
+            if to_cso:
+                self.write_cso_file(job, o, part, out.with_name(out.name + ".part2"), out)
+                return
             os.replace(part, out)
             ok = DiscReader(out, 2048, 0).sector(16)[1:6] == b"CD001"
             job.status = "Done"
@@ -3724,6 +4017,7 @@ class App:
             self.post("log", f"OK  {out}", "ok" if ok else "warn")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            out.with_name(out.name + ".part2").unlink(missing_ok=True)
             if part.exists():
                 try:
                     part.unlink()
@@ -3861,8 +4155,8 @@ class App:
             self.status.config(text="Select one or more .chd files to verify.")
             return
         for j in chds:
-            j.kind = "verify"
-            self.refresh_job(j)
+            j.set_target("verify")
+            self.update_action_labels()
         self.start(chds)
 
     # ------------------------------------------------------------------ CHD Manager's own updates
