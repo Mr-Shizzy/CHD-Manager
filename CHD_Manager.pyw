@@ -2465,6 +2465,8 @@ class App:
         global CHDMAN
         self.root = root
         self.silent = silent
+        self.echo = None                # the command-line mode prints log lines through this
+        self.no_save = False
         self.jobs = []
         self.q = queue.Queue()
         self.running = False
@@ -3393,6 +3395,8 @@ class App:
 
     # ------------------------------------------------------------------ settings
     def save_settings(self):
+        if self.no_save:
+            return
         d = {k: var.get() for k, var in self.v.items()}
         d["chdman"] = self.chd_path_var.get() if hasattr(self, "chd_path_var") else ""
         d["last_dir"] = self.settings.get("last_dir", "")
@@ -3594,6 +3598,8 @@ class App:
         self.logbox.insert("end", text.rstrip("\n") + "\n", tag)
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
+        if self.echo:
+            self.echo(text.rstrip("\n"), tag)
 
     def copy_log(self):
         self.root.clipboard_clear()
@@ -5331,6 +5337,8 @@ class App:
                     self.all_bar["value"] = 100 * ev[1] / max(1, ev[2])
                 elif kind == "label":
                     self.status.config(text=ev[1])
+                    if self.echo:
+                        self.echo(ev[1], "label")
                 elif kind == "info":
                     self.show_info(ev[1], ev[2])
                 elif kind == "upd_info":
@@ -5407,10 +5415,200 @@ def smoke_test(outfile):
     Path(outfile).write_text(json.dumps(report, indent=2), "utf-8")
 
 
+CLI_EPILOG = """\
+examples:
+  CHD Manager cli game.cue --to chd -o D:\\chd
+  CHD Manager cli game.chd --to pbp --level 9 -o D:\\psp
+  CHD Manager cli D:\\roms --to chd --exists overwrite --log convert.txt
+  CHD Manager cli game.chd game2.iso --list
+
+targets (--list shows which ones a given file can become):
+""" + "\n".join(f"  {k:<11}{v}" for k, v in TARGET_LABELS.items()) + """
+  chd_d2, cue_d2, ...   one disc (here the 2nd) of a multi-disc PBP
+
+exit code: 0 = everything done or skipped, 1 = something failed, 2 = wrong command line
+"""
+
+
+def attach_console():
+    """The packaged program is a windowed one, so it has no console of its own; use the one it was started from."""
+    ok = False
+    try:
+        ok = sys.stdout is not None and sys.stdout.writable()
+    except (AttributeError, ValueError, OSError):
+        pass
+    if not ok and os.name == "nt":
+        try:
+            ctypes.windll.kernel32.AttachConsole(-1)
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stderr = sys.stdout
+        except Exception:  # noqa: BLE001
+            pass
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def cli_main(argv):
+    """chdm cli ...: the same conversions as the window, without the window."""
+    import argparse
+    attach_console()
+    ap = argparse.ArgumentParser(prog="CHD Manager cli", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=CLI_EPILOG,
+                                 description=f"{APP_NAME} {APP_VER}: convert disc images from the command line. "
+                                             "Takes files, folders and archives; what each one becomes is chosen with --to.")
+    ap.add_argument("inputs", nargs="*", help="files, folders or archives")
+    ap.add_argument("--to", metavar="TARGET", help="what to make (see below); default: each file's usual action")
+    ap.add_argument("--list", action="store_true", help="only show what each input can become")
+    ap.add_argument("-o", "--output", metavar="DIR", help="output folder (default: next to each source file)")
+    ap.add_argument("--flat", action="store_true", help="with -o: don't recreate the input folders' structure")
+    ap.add_argument("--name", metavar="PATTERN", help="output file name, e.g. \"%%GAMEID%% - %%TITLE%%\" (%%FILENAME%% %%GAMEID%% "
+                    "%%TITLE%% %%MAINTITLE%% %%MAINGAMEID%% %%REGION%%)")
+    ap.add_argument("--exists", choices=("skip", "overwrite", "rename"), default="skip", help="if the output exists (default: skip)")
+    ap.add_argument("--no-verify", action="store_true", help="don't verify each result")
+    ap.add_argument("--compression", choices=("default", "none", "fast", "smallest"), default="default", help="CHD compression")
+    ap.add_argument("--codecs", metavar="LIST", help="custom CHD codecs, e.g. cdlz,cdzl (instead of --compression)")
+    ap.add_argument("--hunk", metavar="BYTES", help="CHD hunk size")
+    ap.add_argument("--threads", type=int, default=0, metavar="N", help="CHD processors (default: all)")
+    ap.add_argument("--level", type=int, choices=range(10), metavar="0-9", help="PBP compression (default 6)")
+    ap.add_argument("--art", metavar="DIR", help="your PBP artwork folder (one subfolder per game)")
+    ap.add_argument("--no-cards", action="store_true", help="don't draw title cards for PBPs without artwork")
+    ap.add_argument("--base-pbp", metavar="FILE", help="base PBP for a real PSP/Vita")
+    ap.add_argument("--chdman", metavar="EXE", help="use this chdman")
+    ap.add_argument("--log", metavar="FILE", help="also write the full log to this file")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show the full log, including chdman's output")
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VER}")
+    a = ap.parse_args(argv)
+    if not a.inputs:
+        ap.print_usage()
+        print("nothing to do: give at least one file, folder or archive (or --help)")
+        return 2
+    if a.to and a.to.partition("_d")[0] not in TARGET_LABELS:
+        print(f"unknown target '{a.to}'. Choose one of: {', '.join(TARGET_LABELS)}")
+        return 2
+    logf = None
+    if a.log:
+        try:
+            logf = open(a.log, "a", encoding="utf-8")
+            logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(argv)} =====\n")
+        except OSError as e:
+            print(f"can't write the log file: {e}")
+            return 2
+
+    def say(text):
+        print(text, flush=True)
+        if logf:
+            logf.write(text + "\n")
+
+    root = tk.Tk()
+    root.withdraw()
+    app = App(root, silent=True)
+    app.no_save = True                                  # a command-line run never changes the window's saved settings
+    code = 1
+    try:
+        for k, d in DEFAULTS.items():                    # only the machine's own paths come from the saved settings
+            if k in app.v and k not in ("base_pbp", "art_dir"):
+                app.v[k].set(d)
+        v = app.v
+        if a.output:
+            v["out_mode"].set("custom")
+            v["out_dir"].set(a.output)
+            v["keep_structure"].set(not a.flat)
+        if a.name:
+            v["name_format"].set(a.name)
+        v["exists"].set(a.exists.capitalize())
+        v["verify_after"].set(not a.no_verify)
+        if a.codecs:
+            v["compression"].set("Custom")
+            v["custom_comp"].set(a.codecs)
+        else:
+            v["compression"].set(a.compression.capitalize())
+        v["hunk"].set(a.hunk or "")
+        v["threads"].set(a.threads)
+        if a.level is not None:
+            v["pbp_level"].set(a.level)
+        if a.art:
+            v["art_dir"].set(a.art)
+        if a.base_pbp:
+            v["base_pbp"].set(a.base_pbp)
+        if a.no_cards:
+            v["title_cards"].set(False)
+        if a.chdman:
+            global CHDMAN
+            found = find_chdman(a.chdman)
+            if not found:
+                say(f"chdman not found: {a.chdman}")
+                return 2
+            CHDMAN = found
+            app.chd_version, app.has_dvd = chdman_info()
+
+        def echo(text, tag):
+            if logf:
+                logf.write(text + "\n")
+            if text.startswith(("Added ", "Click the Action")):
+                return                                  # window hints that mean nothing here
+            if a.verbose and tag != "cmd" or tag in ("label", "warn", "err"):
+                print(text, flush=True)
+        app.echo = echo
+        app.add_paths(a.inputs)
+        if not app.jobs:
+            say("no usable files found in the inputs")
+            return 1
+        if a.list:
+            for j in app.jobs:
+                say(f"{j.path}\n  {j.platform or '?'} · {j.type_label()} · {fmt_size(j.size)}")
+                for k, label in j.available_targets():
+                    say(f"    {k:<11}{label}" + ("   (default)" if k == j.default_target() else ""))
+            return 0
+        todo, bad = [], 0
+        for j in app.jobs:
+            ok = [k for k, _ in j.available_targets()]
+            if a.to and a.to not in ok:
+                say(f"FAIL {j.path.name}: can't become '{a.to}' (it can become: {', '.join(ok) or 'nothing'})")
+                bad += 1
+                continue
+            if a.to:
+                j.set_target(a.to)
+            todo.append(j)
+        if todo:
+            app.start(todo)
+            try:
+                while app.running:
+                    root.update()
+                    time.sleep(0.02)
+                root.update()
+            except KeyboardInterrupt:
+                app.stop()
+                end = time.time() + 15
+                while app.running and time.time() < end:
+                    root.update()
+                    time.sleep(0.02)
+                say("stopped")
+                return 130
+        for j in todo:
+            word = "OK  " if j.status.startswith("Done") else "SKIP" if j.status.startswith("Skipped") else "FAIL"
+            if word == "FAIL":
+                bad += 1
+            say(f"{word} {j.path.name}: " + (j.result if word == "OK  " else j.status if word == "SKIP" else f"{j.status} {j.result}".strip()))
+        code = 1 if bad else 0
+    finally:
+        try:
+            app.drop_all_arcs()
+            root.destroy()
+        except tk.TclError:
+            pass
+        if logf:
+            logf.close()
+    return code
+
+
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "--relaunch-test":
         spawn_swap(write_swap_script(Path(sys.argv[2]), Path(sys.argv[3])))
         return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() in ("cli", "--cli"):
+        sys.exit(cli_main(sys.argv[2:]))
     if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
         SETTINGS_FILE_OVERRIDE = Path(sys.argv[2]).with_suffix(".settings.json")
         globals()["SETTINGS_FILE"] = SETTINGS_FILE_OVERRIDE      # don't touch the real settings during the check

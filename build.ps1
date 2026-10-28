@@ -85,7 +85,7 @@ Remove-Item "$root\dist" -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item "$root\build\exe\CHD Manager.exe" $out
 Copy-Item $chdman "$out\chdman.exe"
-Copy-Item "$root\LICENSE", "$root\THIRD_PARTY_NOTICES.txt", "$root\README.md" $out
+Copy-Item "$root\LICENSE", "$root\THIRD_PARTY_NOTICES.txt", "$root\README.md", "$root\chdm.cmd" $out
 $zip = "$root\dist\CHD-Manager-$ver-win64.zip"
 Compress-Archive -Path $out -DestinationPath $zip -Force
 Write-Host "`nDone." -ForegroundColor Green
