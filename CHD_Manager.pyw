@@ -4390,59 +4390,49 @@ class App:
 
         # --- Formats (what each file becomes is chosen in its Action column; this tab only holds the extras)
         f = tab("Formats")
-        ttk.Checkbutton(f, text="Always put converted discs in a subfolder (discs with several files get one automatically)",
-                        variable=v["extract_subfolder"]).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
-                  text="Pick what each file becomes in the Action column of the list. Only choices that can work for that file are offered. "
-                       "A PBP is for PlayStation 1 discs: with a base PBP (below) it can also run on a PSP with custom firmware, without one it works in "
-                       "emulators and frontends that read PBP; to make one PBP from a multi-disc game, add the game's .m3u playlist. "
-                       "CDI (DiscJuggler) is new and has been checked by reading it back and in an emulator, not in DiscJuggler itself. "
-                       "CSO is the compressed ISO format used for PSP games. "
-                       "Recompress writes a new CHD with the Convert page's compression and hunk size; your original is kept.").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=10)
-        bf = ttk.Frame(f)
-        bf.grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Label(bf, text="Base PBP for real PSP/Vita (optional):").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Entry(bf, textvariable=v["base_pbp"], width=44).grid(row=1, column=0)
-        ttk.Button(bf, text="Browse…", command=self.pick_base_pbp).grid(row=1, column=1, padx=4)
-        ttk.Button(bf, text="Download…", command=self.download_base_pbp_ui).grid(row=1, column=2)
-        af = ttk.Frame(f)
-        af.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(af, text="Artwork folder for PBPs (optional; a subfolder per game with ICON0.PNG, PIC0.PNG, PIC1.PNG, SND0.AT3):").grid(
-            row=0, column=0, columnspan=2, sticky="w")
-        ttk.Entry(af, textvariable=v["art_dir"], width=52).grid(row=1, column=0)
-        ttk.Button(af, text="Browse…", command=self.pick_art_dir).grid(row=1, column=1, padx=4)
-        nf = ttk.Frame(f)
-        nf.grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(nf, text="Output file name (%FILENAME% %GAMEID% %TITLE% %REGION%):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(nf, textvariable=v["name_format"], width=34).grid(row=0, column=1, padx=6)
-        ttk.Button(nf, text="Get game titles…", command=self.download_gamedb_ui).grid(row=0, column=2)
-        tf = ttk.Frame(f)
-        tf.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Checkbutton(tf, text="Draw a title card (game name and code) for PBPs that have no artwork of your own",
-                        variable=v["title_cards"]).grid(row=0, column=0, sticky="w")
-        kf = ttk.Frame(f)
-        kf.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(kf, text="Wii discs to RVZ, WIA or WBFS:").grid(row=0, column=0, sticky="w")
-        ttk.Button(kf, text="Set up…", command=self.show_wii_setup).grid(row=0, column=1, padx=8)
-        self.wii_status = ttk.Label(kf, text="", style="Muted.TLabel")
-        self.wii_status.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        df = ttk.Frame(f)
-        df.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(df, text="Wii / GameCube RVZ and WIA:").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(df, textvariable=v["rvz_method"], width=7, state="readonly",
-                     values=["zstd", "lzma", "lzma2", "bzip2", "none"]).grid(row=0, column=1, padx=(8, 4))
-        ttk.Label(df, text="level").grid(row=0, column=2)
-        ttk.Combobox(df, textvariable=v["rvz_level"], width=4, state="readonly", values=list(range(1, 10))).grid(row=0, column=3, padx=4)
-        ttk.Label(df, text="block").grid(row=0, column=4)
-        ttk.Combobox(df, textvariable=v["rvz_chunk"], width=8, state="readonly",
-                     values=[32768, 65536, 131072, 262144, 524288, 1048576, 2097152]).grid(row=0, column=5, padx=4)
-        ttk.Checkbutton(df, text="WBFS: leave out data nothing uses (scrub)", variable=v["wbfs_scrub"]).grid(
-            row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
-        pf = ttk.Frame(f)
-        pf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(pf, text="PBP compression (0 = none, 9 = smallest):").grid(row=0, column=0, sticky="w")
+        ttk.Label(f, style="Muted.TLabel", wraplength=600, justify="left",
+                  text="What each file becomes is chosen in the Action column of the list; only choices that can work for that file are "
+                       "offered. The options below are the extras for those formats.").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        g1 = ttk.LabelFrame(f, text=" Output file names ", padding=10)
+        g1.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Checkbutton(g1, text="Always put converted discs in a subfolder (discs with several files get one automatically)",
+                        variable=v["extract_subfolder"]).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(g1, text="Name pattern (%FILENAME% %GAMEID% %TITLE% %REGION%):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(g1, textvariable=v["name_format"], width=30).grid(row=1, column=1, padx=6, pady=(8, 0))
+        ttk.Button(g1, text="Get game titles…", command=self.download_gamedb_ui).grid(row=1, column=2, pady=(8, 0))
+
+        g2 = ttk.LabelFrame(f, text=" PlayStation 1 (PBP) ", padding=10)
+        g2.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(g2, text="Base PBP for a real PSP/Vita (optional):").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Entry(g2, textvariable=v["base_pbp"], width=44).grid(row=1, column=0)
+        ttk.Button(g2, text="Browse…", command=self.pick_base_pbp).grid(row=1, column=1, padx=4)
+        ttk.Button(g2, text="Download…", command=self.download_base_pbp_ui).grid(row=1, column=2)
+        ttk.Label(g2, text="Artwork folder (optional; one subfolder per game):").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Entry(g2, textvariable=v["art_dir"], width=44).grid(row=3, column=0)
+        ttk.Button(g2, text="Browse…", command=self.pick_art_dir).grid(row=3, column=1, padx=4)
+        ttk.Checkbutton(g2, text="Draw a title card (game name and code) for PBPs that have no artwork of your own",
+                        variable=v["title_cards"]).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        pf = ttk.Frame(g2)
+        pf.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(pf, text="Compression (0 = none, 9 = smallest):").grid(row=0, column=0, sticky="w")
         ttk.Combobox(pf, textvariable=v["pbp_level"], width=4, state="readonly", values=list(range(10))).grid(row=0, column=1, padx=6)
+
+        g3 = ttk.LabelFrame(f, text=" Wii and GameCube (RVZ, WIA, WBFS) ", padding=10)
+        g3.grid(row=3, column=0, sticky="ew")
+        ttk.Label(g3, text="RVZ / WIA compression:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(g3, textvariable=v["rvz_method"], width=7, state="readonly",
+                     values=["zstd", "lzma", "lzma2", "bzip2", "none"]).grid(row=0, column=1, padx=(8, 4))
+        ttk.Label(g3, text="level").grid(row=0, column=2)
+        ttk.Combobox(g3, textvariable=v["rvz_level"], width=4, state="readonly", values=list(range(1, 10))).grid(row=0, column=3, padx=4)
+        ttk.Label(g3, text="block").grid(row=0, column=4)
+        ttk.Combobox(g3, textvariable=v["rvz_chunk"], width=8, state="readonly",
+                     values=[32768, 65536, 131072, 262144, 524288, 1048576, 2097152]).grid(row=0, column=5, padx=4)
+        ttk.Checkbutton(g3, text="WBFS: leave out data nothing uses (scrub)", variable=v["wbfs_scrub"]).grid(
+            row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ttk.Button(g3, text="Wii setup (Dolphin or your key)…", command=self.show_wii_setup).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.wii_status = ttk.Label(g3, text="", style="Muted.TLabel", wraplength=560, justify="left")
+        self.wii_status.grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # --- Output
         f = tab("Output")
@@ -4997,7 +4987,7 @@ class App:
     def open_settings(self, tab="Convert"):
         w = self.settings_win
         if not getattr(self, "_settings_placed", False):
-            w.geometry(f"780x580+{max(self.root.winfo_rootx() + 80, 0)}+{max(self.root.winfo_rooty() + 60, 0)}")
+            w.geometry(f"780x700+{max(self.root.winfo_rootx() + 80, 0)}+{max(self.root.winfo_rooty() + 40, 0)}")
             self._settings_placed = True
         w.deiconify()
         w.lift()
@@ -6221,7 +6211,7 @@ class App:
 
     def wii_status_text(self):
         if not (WII_KEYS[0] or WII_TOOL[0]):
-            return "Not set up yet: needs Dolphin, or your Wii key (click Set up…)"
+            return "Not set up yet: needs Dolphin, or your Wii key (use the Wii setup button)"
         return "Ready: " + " and ".join(x for x in ("Dolphin found" if WII_TOOL[0] else "", "Wii key found" if WII_KEYS[0] else "") if x)
 
     def open_keys_folder(self):
