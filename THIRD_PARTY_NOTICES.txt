@@ -1197,3 +1197,15 @@ SOFTWARE.
 The MDS, NRG, CloneCD and DiscJuggler (CDI) readers and the CDI writer were
 written from the formats' public descriptions and from examining sample files; no
 code from libMirage, mdf2iso, nrg2iso, ccd2iso, cdirip or similar GPL tools was used.
+
+
+==============================================================================
+6. iPoPS BASE.PBP and DATA.PSP  (optional download, NOT included in CHD Manager)
+==============================================================================
+To make PBP files that run on a real PSP, CHD Manager can - only if the user agrees -
+download two small files, BASE.PBP and DATA.PSP, from the public repository
+https://github.com/julianxhokaxhiu/iPoPS (MIT license, pinned to one commit and
+checked against fixed SHA-256 checksums). They are not part of CHD Manager, are not in
+its repository or release, and are used only to copy the PS1 loader, icon and boot
+logo into the PBP files the user makes. Their contents may be subject to the rights of
+their original authors; the user is responsible for choosing to download them.

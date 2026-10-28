@@ -1258,28 +1258,83 @@ def _disc_head(lay, game_id, title, multi):
     return head
 
 
-def write_pbp(out_path, layouts, game_ids, title, progress, stopped):
-    """Write layouts (one per disc, from cue_layout) as a PBP. One disc -> PSISOIMG0000, several -> PSTITLEIMG000000."""
+def read_base_pbp(path):
+    """The parts of a working PS1 .pbp that a PSP needs and that can't be made from a disc: the loader (DATA.PSP),
+    the icon and pictures, and the boot-logo block (STARTDAT) that follows the disc data."""
+    with open(path, "rb") as f:
+        head = f.read(0x28)
+        if len(head) < 0x28 or head[:4] != b"\x00PBP":
+            raise UnpackError("the base file isn't a PBP")
+        o = struct.unpack("<10I", head)
+        f.seek(0, 2)
+        size = f.tell()
+        if not all(o[i] <= o[i + 1] <= size for i in range(2, 9)) or o[9] + 16 > size:
+            raise UnpackError("the base PBP's header is damaged")
+
+        def part(i):
+            f.seek(o[i])
+            return f.read(o[i + 1] - o[i])
+        psar = o[9]
+        f.seek(psar)
+        if not f.read(16).startswith((b"PSISOIMG0000", b"PSTITLEIMG000000")):
+            raise UnpackError("the base PBP isn't a PlayStation 1 game")
+        f.seek(psar + 0xC)
+        start = psar + struct.unpack("<I", f.read(4))[0]
+        f.seek(start)
+        if f.read(8) != b"STARTDAT":
+            raise UnpackError("the base PBP has no boot-logo block (STARTDAT)")
+        f.seek(start)
+        startdat = f.read()
+        loader = part(8)
+        if loader[:4] == b"~PSP":
+            # Sony's encrypted loader only runs signed content: a PSP shuts down on an unsigned PBP. A plain (ELF)
+            # DATA.PSP next to the base file takes its place, as it does for the popstation family of tools.
+            side = Path(path).with_name("DATA.PSP")
+            plain = side.read_bytes() if side.is_file() else b""
+            if plain[:4] != b"\x7fELF":
+                raise UnpackError("this base PBP carries an encrypted loader that a PSP won't run unsigned; "
+                                  "use a PBP with a plain loader, or put a plain DATA.PSP next to it")
+            loader = plain
+        return dict(icon0=part(3), icon1=part(4), pic0=part(5), pic1=part(6), snd0=part(7), loader=loader, startdat=startdat)
+
+
+# Two fixed byte runs in the header of a multi-disc PBP (offsets 0x214 and 0x28C). They are identical in every real
+# multi-disc PBP examined (two different games) and a PSP shuts down if they are missing.
+PBP_MULTI_BLOCK_A = bytes.fromhex("2900000023480000be18000084670000e14a00006c3d0000d62c0000ae72000052690000905f000049160000f16d0000")
+PBP_MULTI_BLOCK_B = bytes.fromhex(
+    "8c0eae9d398cfe246521ad2d65a961dfd44a1303b4cd325fbdb0f4f98a70be1e392c7dc0c1c66b81aa3c0653941bcee54416cfdbb1e3897ba2d2e7d6c1266b588d2ce6c31597d029c91681b6cc42ee0c2810eaf26b6f903005be4a2f4abcdce587ce19b980deb832ddad8967e0927889e8dc451d0cbe8b994d50b3d658966175")
+
+
+def write_pbp(out_path, layouts, game_ids, title, progress, stopped, donor=None):
+    """Write layouts (one per disc, from cue_layout) as a PBP. One disc -> PSISOIMG0000, several -> PSTITLEIMG000000.
+    With donor (from read_base_pbp) the PBP also carries the loader, icon and boot logo a real PSP needs."""
     n = len(layouts)
     sfo = build_sfo([("BOOTABLE", 1, 4), ("CATEGORY", "ME", 4), ("DISC_ID", game_ids[0], 16), ("DISC_VERSION", "1.00", 8),
-                     ("PARENTAL_LEVEL", 1, 4), ("PSP_SYSTEM_VER", "1.00", 8), ("REGION", 0x8000, 4), ("TITLE", title, 128)])
-    psar = 0x10000
-    after = 0x28 + len(sfo)
-    header = struct.pack("<4sI8I", b"\0PBP", 0x10000, 0x28, after, after, after, after, after, after, psar)
+                     ("LICENSE", "Copyright(C) Sony Computer Entertainment America Inc.", 512), ("PARENTAL_LEVEL", 3, 4),
+                     ("PSP_SYSTEM_VER", "3.01", 8), ("REGION", 0x8000, 4), ("TITLE", title, 128)])
+    res = [donor[k] for k in ("icon0", "icon1", "pic0", "pic1", "snd0", "loader")] if donor else [b""] * 6
+    offs, pos = [0x28], 0x28 + len(sfo)
+    for r in res:
+        offs.append(pos)
+        pos += len(r)
+    psar = max(0x10000, -(-pos // 0x10000) * 0x10000)
+    header = struct.pack("<4sI8I", b"\0PBP", 0x10000, *offs, psar)
     done, all_blocks = 0, sum(-(-l["total"] // 16) for l in layouts) or 1
     with open(out_path, "wb") as g:
-        g.write(header + sfo)
+        g.write(header + sfo + b"".join(res))
         g.write(bytes(psar - g.tell()))
         starts = []
         if n > 1:
-            mh = bytearray(0x3DC)
+            mh = bytearray(0x3FC)
             mh[0:16] = b"PSTITLEIMG000000"
             struct.pack_into("<4I", mh, 0x18, 0x2CC9C5BC, 0x33B5A90F, 0x06F6B4B3, 0xB25945BA)
+            mh[0x214:0x214 + len(PBP_MULTI_BLOCK_A)] = PBP_MULTI_BLOCK_A
             code = ("_" + game_ids[0][:4] + "_" + game_ids[0][4:9]).encode("ascii", "replace")
-            mh[0x240:0x240 + len(code)] = code
+            mh[0x264:0x264 + len(code)] = code
+            mh[0x28C:0x28C + len(PBP_MULTI_BLOCK_B)] = PBP_MULTI_BLOCK_B
             t = title.encode("ascii", "replace")[:120]
-            mh[0x2E8:0x2E8 + len(t)] = t
-            struct.pack_into("<I", mh, 0x368, 7)
+            mh[0x30C:0x30C + len(t)] = t
+            struct.pack_into("<I", mh, 0x38C, 7)
             g.write(mh)
         for d, lay in enumerate(layouts):
             if n > 1:
@@ -1287,7 +1342,7 @@ def write_pbp(out_path, layouts, game_ids, title, progress, stopped):
             base = g.tell()
             starts.append(base - psar)
             blocks = -(-lay["total"] // 16)
-            head = _disc_head(lay, game_ids[d], title, n > 1)
+            head = _disc_head(lay, game_ids[d], f"{title} [Disc{d + 1}of{n}]" if n > 1 else title, n > 1)
             struct.pack_into("<I", head, 0xC, blocks * PBP_BLOCK + 0x100000)
             g.write(head)
             index = bytearray(blocks * 32)
@@ -1317,11 +1372,13 @@ def write_pbp(out_path, layouts, game_ids, title, progress, stopped):
                 g.seek(base + 0x1220)
                 g.write(struct.pack("<I", end - psar + 0x2D31))
             g.seek(end)
+        if donor:
+            g.write(donor["startdat"])                   # the boot-logo block sits right after the disc data
         if n > 1:
-            end = g.tell()
+            end = g.tell() - (len(donor["startdat"]) if donor else 0)
             g.seek(psar + 0x10)
             g.write(struct.pack("<I", end - psar))
-            g.seek(psar + 0x260)
+            g.seek(psar + 0x284)
             g.write(struct.pack("<I", end - psar + 0x2D31))
             g.seek(psar + 0x200)
             g.write(struct.pack("<5I", *(starts + [0] * (5 - n))))
@@ -1359,6 +1416,56 @@ def verify_pbp(path, layouts, progress, stopped):
                     if stopped():
                         raise UnpackError("stopped")
     return True
+
+
+# A PBP only runs on a real PSP/Vita if it carries Sony's PS1 loader, which can't be made from a disc and is not
+# shipped with CHD Manager. The user can point the app at any working PS1 PBP, or let it fetch this generic one
+# (pinned to one commit of the public repository and checked against a fixed checksum).
+BASE_PBP_FILES = [   # (name, url, sha-256)
+    ("BASE.PBP", "https://raw.githubusercontent.com/julianxhokaxhiu/iPoPS/f8afadd32e9e55e0ea9bf73cf3306890ffebe629/BASE.PBP",
+     "de0d743be8e721b4167679de5655c0df99667844e0da31bcd96397b09b192614"),
+    ("DATA.PSP", "https://raw.githubusercontent.com/julianxhokaxhiu/iPoPS/f8afadd32e9e55e0ea9bf73cf3306890ffebe629/DATA.PSP",
+     "9a995e281433c6671e8fc9efc16a130f865e5db03e2d5e6cfbba29ab34ec2fb8"),
+]
+
+
+def find_base_pbp(saved=""):
+    """A usable base PBP: the one chosen in Settings, else BASE.PBP next to the program. None if there isn't one."""
+    for c in (saved, str(HERE / "BASE.PBP")):
+        if c and Path(c).is_file():
+            try:
+                read_base_pbp(c)
+                return Path(c)
+            except (UnpackError, OSError):
+                continue
+    return None
+
+
+def download_base_pbp(dest_dir):
+    """Fetch BASE.PBP and DATA.PSP into dest_dir, each checked against its fixed checksum, and keep them only if
+    together they make a usable base."""
+    dest_dir = Path(dest_dir)
+    tmp = Path(tempfile.mkdtemp(prefix="chdm_base_"))
+    try:
+        for name, url, want in BASE_PBP_FILES:
+            h, got = hashlib.sha256(), 0
+            with http_get(url, 60) as r, open(tmp / name, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    if got > 20 << 20:
+                        raise RuntimeError("the download is far larger than expected")
+            if h.hexdigest() != want:
+                raise RuntimeError(f"the checksum of {name} doesn't match, so the download was discarded")
+        read_base_pbp(tmp / "BASE.PBP")
+        for name, _url, _want in BASE_PBP_FILES:
+            os.replace(tmp / name, dest_dir / name)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------------------------------- CHD -> CDI (DiscJuggler, version 2 layout)
@@ -1676,7 +1783,7 @@ DEFAULTS = {
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
     "chd_action": "Extract", "extract_format": "auto", "split_bin": False, "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
-    "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
+    "base_pbp": "", "base_pbp_ask": True, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
 
 
@@ -1987,11 +2094,17 @@ class App:
         ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
                   text="Automatic reads the CHD: CD discs become .cue + .bin (one BIN per track when the disc has more than one track), Dreamcast GD-ROM discs become .gdi, DVD discs become .iso. "
                        "ISO works for data discs with a single track and refuses audio or multi-track discs rather than lose data. "
-                       "PBP is for PlayStation 1 discs and is meant for emulators and frontends that read it (it is not a signed PSP/Vita game); "
+                       "PBP is for PlayStation 1 discs: with a base PBP (below) it can also run on a PSP with custom firmware, without one it works in emulators and frontends that read PBP; "
                        "to make one PBP from a multi-disc game, add the game's .m3u playlist instead of the separate CHDs. "
                        "CDI (DiscJuggler) is for CD discs, mainly Dreamcast; it is new and has been checked by reading it back and in an emulator, not in DiscJuggler itself. "
                        "Recompress writes a new CHD with the Convert page's compression and hunk size; your original is kept.").grid(
             row=10, column=0, columnspan=2, sticky="w", pady=10)
+        bf = ttk.Frame(f)
+        bf.grid(row=11, column=0, columnspan=2, sticky="w")
+        ttk.Label(bf, text="Base PBP for real PSP/Vita (optional):").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Entry(bf, textvariable=v["base_pbp"], width=44).grid(row=1, column=0)
+        ttk.Button(bf, text="Browse…", command=self.pick_base_pbp).grid(row=1, column=1, padx=4)
+        ttk.Button(bf, text="Download…", command=self.download_base_pbp_ui).grid(row=1, column=2)
         v["chd_action"].trace_add("write", lambda *a: self.apply_chd_action())
 
         # --- Output
@@ -2721,7 +2834,60 @@ class App:
             o["threads"] = int(o["threads"])
         except (ValueError, tk.TclError):
             o["threads"] = 0
+        o["base_pbp_file"] = str(find_base_pbp(o.get("base_pbp", "")) or "")
         return o
+
+    BASE_PBP_TEXT = ("A PBP needs a small loader program from Sony to run on a real PSP or Vita. CHD Manager doesn't include it, "
+                     "but can download a generic PBP that has one from the public GitHub repository julianxhokaxhiu/iPoPS "
+                     "(two files, about 1.4 MB, each checked against a fixed checksum) and keep it next to CHD Manager.exe as BASE.PBP and DATA.PSP. "
+                     "It is only used to copy the loader, icon and boot logo into the PBPs you make. "
+                     "You can also choose any working PlayStation 1 .pbp of your own in Settings, CHD files.")
+
+    def pbp_jobs(self, todo):
+        fmt = self.v["extract_format"].get()
+        return any(j.kind == "extract" and (j.path.suffix.lower() == ".m3u" or (fmt == "pbp" and j.disc == "CD")) for j in todo)
+
+    def offer_base_pbp(self):
+        """Before making PBPs without a base: offer the download once. False = don't start."""
+        if self.silent or not self.v["base_pbp_ask"].get() or find_base_pbp(self.v["base_pbp"].get()):
+            return True
+        ans = messagebox.askyesnocancel(
+            APP_NAME, self.BASE_PBP_TEXT + "\n\nYes: download it now.\nNo: make PBPs without it (they work in emulators and "
+            "frontends, not on a PSP/Vita) and don't ask again.\nCancel: don't start yet.")
+        if ans is None:
+            return False
+        if ans:
+            self.download_base_pbp_ui(confirm=False)
+        else:
+            self.v["base_pbp_ask"].set(False)
+        return True
+
+    def download_base_pbp_ui(self, confirm=True):
+        if self.silent or (confirm and not messagebox.askyesno(APP_NAME, self.BASE_PBP_TEXT + "\n\nDownload it now?")):
+            return False
+        self.status.config(text="Downloading the base PBP…")
+        self.root.update_idletasks()
+        try:
+            download_base_pbp(HERE)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Could not get the base PBP: {e}\n\nYou can still pick a PBP of your own in Settings.")
+            self.update_status_idle()
+            return False
+        self.log(f"Saved BASE.PBP and DATA.PSP next to the program ({HERE}).", "ok")
+        self.update_status_idle()
+        return True
+
+    def pick_base_pbp(self):
+        p = filedialog.askopenfilename(title="Choose a working PlayStation 1 .pbp",
+                                       filetypes=[("PBP files", "*.pbp"), ("All files", "*.*")])
+        if not p:
+            return
+        try:
+            read_base_pbp(p)
+        except (UnpackError, OSError) as e:
+            messagebox.showerror(APP_NAME, f"That file can't be used as a base PBP: {e}")
+            return
+        self.v["base_pbp"].set(p)
 
     def start(self, only=None):
         if self.running:
@@ -2733,6 +2899,8 @@ class App:
         todo = [j for j in (only if only is not None else self.jobs) if not j.status.startswith("Done")]
         if not todo:
             self.status.config(text="Nothing to do - add files first.")
+            return
+        if self.pbp_jobs(todo) and not self.offer_base_pbp():
             return
         for j in todo:
             j.status, j.result = "Queued", ""
@@ -3163,10 +3331,19 @@ class App:
                     return fail("Failed (not PS1)", f"{chd.name} doesn't look like a PlayStation 1 game, so it can't go in a PBP.")
                 layouts.append(lay)
                 ids.append(gid)
+            donor = None
+            if o.get("base_pbp_file"):
+                try:
+                    donor = read_base_pbp(o["base_pbp_file"])
+                except (UnpackError, OSError) as e:
+                    self.post("log", f"The base PBP wasn't used: {e}", "warn")
+            self.post("log", f"Using base PBP {Path(o['base_pbp_file']).name} (loader, icon and boot logo for a PSP/Vita)." if donor else
+                      "No base PBP: this PBP works in emulators and frontends, but a PSP/Vita needs one (Settings, CHD files).",
+                      "info" if donor else "warn")
             title = re.sub(r"\s*\((?:disc|cd)\s*\d+\)", "", out.stem, flags=re.I)
             title = re.sub(r"\s*\[[^\]]*\]", "", title).strip() or out.stem
             try:
-                write_pbp(part, layouts, ids, title, lambda x: prog("Writing PBP", x), lambda: self.stop_flag)
+                write_pbp(part, layouts, ids, title, lambda x: prog("Writing PBP", x), lambda: self.stop_flag, donor=donor)
                 if o["verify_after"]:
                     if not verify_pbp(part, layouts, lambda x: prog("Verifying", x), lambda: self.stop_flag):
                         return fail("Verify failed", "the finished PBP didn't match the disc it was made from; it was discarded.")
