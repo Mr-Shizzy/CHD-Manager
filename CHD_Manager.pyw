@@ -2347,9 +2347,7 @@ def find_dolphintool(configured=""):
 
 def wii_can(what):
     """Whether a conversion that needs the Wii key can be done on this PC: 'rvz' (RVZ and WIA) or 'wbfs'."""
-    if WII_KEYS[0]:
-        return True
-    return bool(WII_TOOL[0]) if what == "rvz" else not WII_SCRUB[0]
+    return bool(WII_KEYS[0] or WII_TOOL[0]) or (what == "wbfs" and not WII_SCRUB[0])
 
 
 def wii_partitions(disc):
@@ -4425,14 +4423,10 @@ class App:
                         variable=v["title_cards"]).grid(row=0, column=0, sticky="w")
         kf = ttk.Frame(f)
         kf.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(kf, text="Wii conversions need your Wii key, or Dolphin's DolphinTool.exe (optional path):").grid(
-            row=0, column=0, columnspan=3, sticky="w")
-        ttk.Entry(kf, textvariable=v["dolphintool"], width=44).grid(row=1, column=0)
-        ttk.Button(kf, text="Browse…", command=self.pick_dolphintool).grid(row=1, column=1, padx=4)
-        ttk.Button(kf, text="Wii key…", command=self.show_keys_dialog).grid(row=1, column=2)
+        ttk.Label(kf, text="Wii discs to RVZ, WIA or WBFS:").grid(row=0, column=0, sticky="w")
+        ttk.Button(kf, text="Set up…", command=self.show_wii_setup).grid(row=0, column=1, padx=8)
         self.wii_status = ttk.Label(kf, text="", style="Muted.TLabel")
-        self.wii_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        ttk.Button(kf, text="Open the keys folder", command=self.open_keys_folder).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.wii_status.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
         df = ttk.Frame(f)
         df.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Label(df, text="Wii / GameCube RVZ and WIA:").grid(row=0, column=0, sticky="w")
@@ -6226,13 +6220,9 @@ class App:
             self.update_action_labels()
 
     def wii_status_text(self):
-        return ("Wii key: found" if WII_KEYS[0] else "Wii key: none") + "   ·   " + \
-               (f"Dolphin tool: {WII_TOOL[0]}" if WII_TOOL[0] else "Dolphin tool: not found")
-
-    def pick_dolphintool(self):
-        p = filedialog.askopenfilename(title="Choose DolphinTool.exe", filetypes=[("DolphinTool", "DolphinTool.exe"), ("Programs", "*.exe")])
-        if p:
-            self.v["dolphintool"].set(p)
+        if not (WII_KEYS[0] or WII_TOOL[0]):
+            return "Not set up yet: needs Dolphin, or your Wii key (click Set up…)"
+        return "Ready: " + " and ".join(x for x in ("Dolphin found" if WII_TOOL[0] else "", "Wii key found" if WII_KEYS[0] else "") if x)
 
     def open_keys_folder(self):
         ensure_keys_dir()
@@ -6257,74 +6247,139 @@ class App:
         y = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - w.winfo_reqheight()) // 3)
         w.geometry(f"+{x}+{y}")
 
-    def show_keys_dialog(self):
-        w, fr = self.themed_dialog("Wii key")
-        ttk.Label(fr, justify="left", text="Paste your Wii common key: 32 hexadecimal characters.\n"
-                  "CHD Manager contains no keys and never downloads them.").grid(row=0, column=0, columnspan=3, sticky="w")
-        c, k = tk.StringVar(value=self.v["wii_common_key"].get()), tk.StringVar(value=self.v["wii_korean_key"].get())
-        ttk.Label(fr, text="Common key").grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(fr, textvariable=c, width=42).grid(row=1, column=1, columnspan=2, padx=8, pady=(12, 0))
-        ttk.Label(fr, text="Korean key (only for Korean discs)").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(fr, textvariable=k, width=42).grid(row=2, column=1, columnspan=2, padx=8, pady=(6, 0))
+    def show_wii_setup(self):
+        """One window for everything Wii: show where Dolphin is, or give your key (pick the file, or paste it)."""
+        old = getattr(self, "wii_win", None)
+        try:
+            if old is not None and old.winfo_exists():
+                old.lift()
+                return
+        except tk.TclError:
+            pass
+        w, fr = self.themed_dialog("Wii setup")
+        self.wii_win = w
+        ttk.Label(fr, justify="left", wraplength=470, font=("Segoe UI Semibold", 10),
+                  text="To turn a Wii disc into RVZ, WIA or WBFS, CHD Manager needs ONE of these two things:").grid(
+            row=0, column=0, sticky="w")
+        o1 = ttk.LabelFrame(fr, text=" Option 1: Dolphin (the easy way) ", padding=10)
+        o1.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(o1, justify="left", wraplength=450, text="If Dolphin is on this PC, just show CHD Manager where it is. "
+                  "That is all it needs; no key is required.").grid(row=0, column=0, columnspan=2, sticky="w")
+        d_stat = ttk.Label(o1, text="", wraplength=300, justify="left")
+        d_stat.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
+        o2 = ttk.LabelFrame(fr, text=" Option 2: your own Wii key ", padding=10)
+        o2.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(o2, justify="left", wraplength=450, text="Choose the file that holds your key, or paste the key "
+                  "(32 letters and numbers). CHD Manager contains no keys and never downloads them.").grid(row=0, column=0, columnspan=3, sticky="w")
+        k_stat = ttk.Label(o2, text="", wraplength=300, justify="left")
+        k_stat.grid(row=1, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0))
+        pasted = tk.StringVar()
+        ttk.Label(o2, text="Or paste the key here:").grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Entry(o2, textvariable=pasted, width=38).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(fr, justify="left", wraplength=470, style="Muted.TLabel", text="Without either, a Wii disc can still become an ISO, "
+                  "GCZ or CISO. GameCube and Wii U discs and every other format never need any of this.").grid(
+            row=3, column=0, sticky="w", pady=(10, 0))
 
-        def save():
-            for label, var in (("common", c), ("Korean", k)):
-                if var.get().strip() and not parse_wii_keys(var.get().strip().encode("ascii", "ignore"))[0]:
-                    messagebox.showerror(APP_NAME, f"The {label} key must be 32 hexadecimal characters.", parent=w)
-                    return
-            self.v["wii_common_key"].set(c.get().strip())
-            self.v["wii_korean_key"].set(k.get().strip())
+        def refresh():
+            d_stat.config(text=f"✓ Found: {WII_TOOL[0]}" if WII_TOOL[0] else "Not set yet")
+            k_stat.config(text="✓ A key is set" if WII_KEYS[0] else "Not set yet")
+            self.wii_status.config(text=self.wii_status_text())
+
+        def find_dolphin():
+            p = filedialog.askopenfilename(parent=w, title="Find Dolphin: choose Dolphin.exe (or DolphinTool.exe)",
+                                           filetypes=[("Dolphin", "Dolphin.exe DolphinTool.exe"), ("All programs", "*.exe")])
+            if not p:
+                return
+            p = Path(p)
+            if p.name.lower() == "dolphin.exe":
+                p = p.with_name("DolphinTool.exe")
+            if p.name.lower() != "dolphintool.exe" or not p.is_file():
+                messagebox.showerror(APP_NAME, "That isn't Dolphin, or this Dolphin has no DolphinTool.exe next to it. "
+                                     "Pick Dolphin.exe from the Dolphin folder (a recent Dolphin download).", parent=w)
+                return
+            self.v["dolphintool"].set(str(p))
             self.save_settings()
-            w.destroy()
+            refresh()
+
+        def take_key(data, name=""):
+            keys = parse_wii_keys(data, name)
+            if not keys[0] and not keys[1]:
+                messagebox.showerror(APP_NAME, "No key found there. A key is 32 letters and numbers (0-9 and a-f).", parent=w)
+                return
+            if keys[0]:
+                self.v["wii_common_key"].set(keys[0].hex())
+            if keys[1]:
+                self.v["wii_korean_key"].set(keys[1].hex())
+            self.save_settings()
+            pasted.set("")
+            refresh()
+
+        def choose_key():
+            p = filedialog.askopenfilename(parent=w, title="Choose the file that holds your Wii key",
+                                           filetypes=[("Key files", "*.txt *.key *.bin *.hex"), ("All files", "*.*")])
+            if not p:
+                return
+            try:
+                if Path(p).stat().st_size > 4096:
+                    raise OSError("that file is too big to be a key file")
+                take_key(Path(p).read_bytes(), Path(p).name)
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Couldn't read that file: {e}", parent=w)
+
+        ttk.Button(o1, text="Find Dolphin…", style="Accent.TButton", command=find_dolphin).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(o2, text="Choose key file…", style="Accent.TButton", command=choose_key).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(o2, text="Use this key", command=lambda: take_key(pasted.get().strip().encode("ascii", "ignore"))).grid(
+            row=3, column=2, padx=(8, 0), pady=(4, 0))
         bf = ttk.Frame(fr)
-        bf.grid(row=3, column=0, columnspan=3, sticky="e", pady=(16, 0))
-        ttk.Button(bf, text="Open the keys folder", command=self.open_keys_folder).pack(side="left", padx=(0, 20))
-        ttk.Button(bf, text="Cancel", command=w.destroy).pack(side="left", padx=4)
-        ttk.Button(bf, text="Save", style="Accent.TButton", command=save).pack(side="left")
+        bf.grid(row=4, column=0, sticky="e", pady=(14, 0))
+        ttk.Button(bf, text="Open the keys folder", command=self.open_keys_folder).pack(side="left", padx=(0, 16))
+        ttk.Button(bf, text="Done", command=w.destroy).pack(side="left")
+        refresh()
         self.place_dialog(w)
-        w.grab_set()
 
     def wii_warning(self):
-        """At start: tell the user that Wii conversions are off because there is neither a key nor Dolphin on this PC."""
+        """At start: say that Wii to RVZ/WIA/WBFS is switched off until Dolphin or a key is set up."""
         if WII_KEYS[0] or WII_TOOL[0] or self.v["wii_warn_off"].get():
             return
         w, fr = self.themed_dialog("Wii keys needed")
         ttk.Label(fr, justify="left", wraplength=430, text=(
-            "Converting a Wii disc to RVZ, WIA or WBFS needs your own Wii key, or Dolphin installed on this PC. "
-            "Neither was found, so those conversions are switched off.\n\n"
-            "Everything else works without it, including GameCube and Wii U discs and every other format.\n\n"
-            "Add your key now? You can also put it in the keys folder next to this program, or point Settings at DolphinTool.exe.")
+            "Turning a Wii disc into RVZ, WIA or WBFS needs Dolphin on this PC, or your own Wii key. Neither was found, "
+            "so those conversions are switched off for now.\n\n"
+            "Everything else works without it: GameCube and Wii U discs and every other format, and Wii discs can still "
+            "become ISO, GCZ or CISO.\n\nSet it up now? It takes a moment: just show it where Dolphin is, or give it your key.")
                   ).grid(row=0, column=0, columnspan=2, sticky="w")
         dont = tk.BooleanVar(value=False)
         ttk.Checkbutton(fr, text="Don't show this again", variable=dont).grid(row=1, column=0, sticky="w", pady=(14, 0))
 
-        def close(add):
+        def close(setup):
             if dont.get():
                 self.v["wii_warn_off"].set(True)
                 self.save_settings()
             w.destroy()
-            if add:
-                self.show_keys_dialog()
+            if setup:
+                self.show_wii_setup()
         bf = ttk.Frame(fr)
         bf.grid(row=1, column=1, sticky="e", pady=(14, 0))
         ttk.Button(bf, text="Not now", command=lambda: close(False)).pack(side="left", padx=4)
-        ttk.Button(bf, text="Add key…", style="Accent.TButton", command=lambda: close(True)).pack(side="left")
+        ttk.Button(bf, text="Set up…", style="Accent.TButton", command=lambda: close(True)).pack(side="left")
         w.protocol("WM_DELETE_WINDOW", lambda: close(False))
         self.place_dialog(w)
 
-    def dolphin_convert(self, job, o, t, part, method):
-        """Wii disc -> RVZ/WIA with the user's own DolphinTool.exe (used when there is no Wii key). True on success."""
+    def dolphin_convert(self, job, o, t, part, method, scrub=False):
+        """Wii disc -> RVZ/WIA (or a scrubbed ISO) with the user's own DolphinTool.exe, used when there is no Wii key. True on success."""
         tool = find_dolphintool(o.get("dolphintool", ""))
         if not tool:
-            job.status, job.result = "Failed (key needed)", "this needs your Wii key or DolphinTool.exe (see Settings, Formats)"
+            job.status, job.result = "Failed (setup needed)", "this needs Dolphin or your Wii key (Settings, Formats, Set up…)"
             self.post("log", f"{job.path.name}: {job.result}", "err")
             return False
-        name = {v: k for k, v in self.RVZ_METHODS.items()}[method]
-        chunk = o["rvz_chunk"] if t == "rvz" else 0x200000
         udir = Path(tempfile.mkdtemp(prefix="chdm_dolphin_"))
         try:
-            cmd = [tool, "convert", "-i", str(job.path), "-o", str(part), "-f", t, "-b", str(chunk), "-c", name, "-l",
-                   str(o["rvz_level"]), "-u", str(udir)]
+            cmd = [tool, "convert", "-i", str(job.path), "-o", str(part), "-f", t, "-u", str(udir)]
+            if t == "iso":
+                cmd += ["-s"] if scrub else []
+            else:
+                name = {v: k for k, v in self.RVZ_METHODS.items()}[method]
+                cmd += ["-b", str(o["rvz_chunk"] if t == "rvz" else 0x200000), "-c", name, "-l", str(o["rvz_level"])]
             self.post("log", "No Wii key, so Dolphin's own tool does the work:", "info")
             self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
             rc = self.run_proc(cmd, job, "Converting with Dolphin")
@@ -6351,7 +6406,7 @@ class App:
         self.post("log", f"\n{job.path.name}  [{job.platform}: {fmt} → {t.upper()}]", "info")
         prog = self.cso_progress(job, "Converting")
         stop = lambda: self.stop_flag  # noqa: E731
-        src = None
+        src = vsrc = tmpiso = None
         try:
             src = open_disc(job.path)
             if t in ("iso", "wud"):
@@ -6362,6 +6417,12 @@ class App:
                 write_gcz(src, part, prog, stop)
             elif t == "ciso":
                 write_ciso(src, part, prog, stop)
+            elif t == "wbfs" and job.platform == "Wii" and o["wbfs_scrub"] and not WII_KEYS[0]:
+                tmpiso = out.with_name(f".{out.stem[:40]}.chdm_scrub.iso")
+                if not self.dolphin_convert(job, o, "iso", tmpiso, 0, scrub=True):
+                    return
+                vsrc = open_disc(tmpiso)
+                write_wbfs(vsrc, part, prog, stop, scrub=False)
             elif t == "wbfs":
                 write_wbfs(src, part, prog, stop, scrub=bool(o["wbfs_scrub"]))
             else:
@@ -6374,7 +6435,7 @@ class App:
                 else:
                     write_rvz(src, part, prog, stop, rvz=t == "rvz", method=method, level=o["rvz_level"], chunk=o["rvz_chunk"])
             if o["verify_after"] and t not in ("iso", "wud"):
-                if not verify_disc_file(part, src, t, self.cso_progress(job, "Verifying"), stop):
+                if not verify_disc_file(part, vsrc or src, t, self.cso_progress(job, "Verifying"), stop):
                     job.status, job.result = "Verify failed", "the finished file didn't match the disc it was made from; it was discarded."
                     self.post("log", f"{job.path.name}: {job.result}", "err")
                     return
@@ -6391,9 +6452,12 @@ class App:
             self.post("log", f"{job.path.name}: {e}", "err")
             return
         finally:
-            if src:
-                src.close()
-            part.unlink(missing_ok=True)
+            for d in (src, vsrc):
+                if d:
+                    d.close()
+            for f in (part, tmpiso):
+                if f:
+                    f.unlink(missing_ok=True)
         job.out_size = out.stat().st_size
         job.status, job.result = "Done", f"→ {out.name}"
         self.post("log", f"OK  {out}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
