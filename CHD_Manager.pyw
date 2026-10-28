@@ -3819,6 +3819,42 @@ def parse_cue_tracks(p):
 
 
 # ------------------------------------------------------------------------- Job
+# ---- Disk space: a conversion that clearly cannot fit is refused before anything is written
+SPACE_MARGIN = 64 * 1024 ** 2        # file system overhead and a little slack
+# What a target's file is, against the size of the unpacked disc. Compressed targets use a typical figure, not the
+# best case, so a job is only refused when it clearly won't fit. Anything not listed is taken at the full size.
+SPACE_RATIO = {"chd": 0.7, "cso": 0.95, "zso": 0.95, "ecm": 0.95, "pbp": 0.8, "rvz": 0.8, "wia": 0.8, "gcz": 0.8,
+               "wbfs": 0.95, "art": 0.0}
+SPACE_EXT = {"chd": ".chd", "recompress": ".chd", "cue": ".cue", "cue_split": ".cue", "cue_single": ".cue", "iso": ".iso",
+             "gdi": ".gdi", "pbp": ".pbp", "cdi": ".cdi", "cso": ".cso", "zso": ".zso", "ecm": ".ecm", "rvz": ".rvz",
+             "wia": ".wia", "gcz": ".gcz", "ciso": ".ciso", "wbfs": ".wbfs", "wux": ".wux", "wud": ".wud"}
+
+
+def chd_logical_size(path):
+    """The unpacked size of a CHD in bytes, read from its header (None when it can't be read)."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(40)
+    except OSError:
+        return None
+    if len(h) < 40 or h[:8] != b"MComprHD":
+        return None
+    ver = struct.unpack(">I", h[12:16])[0]
+    if ver == 5:
+        return struct.unpack(">Q", h[32:40])[0]
+    if ver in (3, 4):
+        return struct.unpack(">Q", h[28:36])[0]
+    return None
+
+
+def free_space(path):
+    """(the nearest folder that exists, bytes free on its drive)."""
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return p, shutil.disk_usage(p).free
+
+
 class Job:
     def __init__(self, path, root=None):
         self.path = Path(path)
@@ -3837,6 +3873,7 @@ class Job:
         self.disc_count = 1            # discs inside a PBP
         self.m3u_chds = []             # for a playlist: its CHD files, one per disc
         self.size = 0
+        self._raw = None
         self.src_files = []
         self.missing = []
         self.lone_bin = False
@@ -3852,6 +3889,36 @@ class Job:
     @property
     def type(self):
         return self.override if self.override != "Auto" else self.auto_type
+
+    def raw_size(self):
+        """About how many bytes the disc holds unpacked: a CHD, CSO, PBP or Wii disc file is smaller than what is in it."""
+        if self._raw is None:
+            self._raw = self._raw_size()
+        return self._raw
+
+    def _raw_size(self):
+        p, ext = self.path, self.path.suffix.lower()
+        try:
+            if ext == ".chd":
+                return chd_logical_size(p) or self.size * 3
+            if ext == ".m3u":
+                return sum(chd_logical_size(c) or c.stat().st_size * 3 for c in self.m3u_chds)
+            if self.container == "cso":
+                return read_cso_header(p)[0]
+            if self.container == "disc":
+                d = open_disc(p)
+                try:
+                    return d.size
+                finally:
+                    d.close()
+            if self.container == "ecm":
+                return int(self.size * 1.2)
+            if self.container == "pbp":
+                n = int(self.size * 1.6)
+                return n // self.disc_count if self.disc_pick and self.disc_count > 1 else n
+        except (OSError, UnpackError, ValueError, struct.error):
+            pass
+        return self.size
 
     def set_target(self, target):
         self.target = target
@@ -5519,6 +5586,16 @@ class App:
                 continue
             self.post("overall", i, total)
             self.post("label", f"[{i + 1}/{total}] {job.path.name}")
+            try:
+                why = self.space_check(job, o)
+            except Exception:  # noqa: BLE001  (a fault in the estimate must never block a conversion)
+                why = None
+            if why:
+                job.status, job.result = "Failed (disk space)", why
+                self.post("log", f"{job.path.name}: {why}", "err")
+                self.post("job", job)
+                stats["fail"] += 1
+                continue
             job.status = "Working…"
             self.post("job", job)
             started = time.time()
@@ -5578,7 +5655,7 @@ class App:
             fmt = fmt.replace(k, v)
         return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", fmt).strip(" .") or stem
 
-    def output_path(self, job, o, ext, multi=False):
+    def output_path(self, job, o, ext, multi=False, make=True):
         stem = self.out_stem(job, o)
         if o["out_mode"] == "custom" and o["out_dir"]:
             base = Path(o["out_dir"])
@@ -5591,8 +5668,57 @@ class App:
             base = job.home.parent
         if job.kind == "extract" and (multi or o["extract_subfolder"]):
             base = base / stem
-        base.mkdir(parents=True, exist_ok=True)
+        if make:
+            base.mkdir(parents=True, exist_ok=True)
         return base / (stem + ext)
+
+    def space_needs(self, job, o):
+        """[(folder, bytes)] this job will occupy at its peak: the finished file plus any temporary files, which are
+        always written next to it. The ECM check also unpacks to the Windows temp folder."""
+        t = (job.target or "").partition("_d")[0]
+        if t == "verify":
+            return []
+        raw = job.raw_size()
+        ext = job.path.suffix.lower()
+        final = job.size if t == "recompress" else int(raw * SPACE_RATIO.get(t, 1.0))
+        extra = 0
+        if job.container == "disc":
+            if t == "wbfs" and job.platform == "Wii" and o["wbfs_scrub"] and not WII_KEYS[0]:
+                extra = raw                                  # the scrubbed ISO Dolphin makes first
+        elif ext == ".chd":
+            if t in ("cso", "zso", "ecm", "pbp", "cdi", "cue_fix") or (t == "iso" and job.disc == "CD"):
+                extra = raw                                  # extracted to a temporary folder first
+        elif job.kind == "convert":
+            extra = raw if job.container else 0              # PBP / CDI / images are unpacked first
+        else:
+            direct = (t == "cue" and job.container in ("pbp", "cdi", "image", "ecm")) or \
+                     (t in ("cso", "zso") and (job.container == "cso" or (ext == ".iso" and not job.wrap_cue))) or \
+                     (t == "iso" and job.container == "cso") or t in ("cue_fix", "art")
+            if not direct:                                   # through a temporary uncompressed CHD
+                extra = raw + (raw if job.container else 0)
+        out = self.output_path(job, o, SPACE_EXT.get(t, ".x"), make=False).parent
+        needs = [(out, final + extra)]
+        if t == "ecm" and o["verify_after"]:
+            needs.append((Path(tempfile.gettempdir()), raw))
+        return needs
+
+    def space_check(self, job, o):
+        """None when the job fits; otherwise a plain sentence saying how much is needed and how much is free."""
+        needs = self.space_needs(job, o)
+        t = (job.target or "").partition("_d")[0]
+        ext = SPACE_EXT.get(t)
+        if ext and o["exists"] == "Skip" and self.output_path(job, o, ext, make=False).exists():
+            return None                                      # it will be skipped, so it needs no room
+        drives = {}
+        for folder, n in needs:
+            near, free = free_space(folder)
+            d = drives.setdefault(os.stat(near).st_dev, [near, free, 0])
+            d[2] += n
+        for near, free, n in drives.values():
+            if n > 0 and free < n * 1.03 + SPACE_MARGIN:
+                return (f"Not enough free space on {near.anchor or near}: about {fmt_size(n)} is needed there, "
+                        f"but only {fmt_size(free)} is free. Free up some room or choose another Output folder.")
+        return None
 
     def handle_exists(self, job, out, o):
         """-> (out, force, skip)"""
