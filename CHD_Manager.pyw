@@ -404,6 +404,18 @@ def recycle(paths):
     return res == 0 and not op.fAnyOperationsAborted
 
 
+def delete_forever(paths):
+    """Delete files for good (not recoverable; frees the space at once). Returns True when every one is gone."""
+    ok = True
+    for p in paths:
+        try:
+            if Path(p).exists():
+                Path(p).unlink()
+        except OSError:
+            ok = False
+    return ok
+
+
 # ------------------------------------------------- CHD Manager's own updates (GitHub releases)
 APP_REPO = "Mr-Shizzy/CHD-Manager"
 APP_RELEASE_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -4153,7 +4165,7 @@ class Job:
 # --------------------------------------------------------------------------- App
 DEFAULTS = {
     "chdman": "", "compression": "Default", "custom_comp": "", "hunk": "", "threads": 0,
-    "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
+    "exists": "Skip", "verify_after": True, "delete_src": False, "delete_forever": False, "auto_cue": True,
     "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
     "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "rvz_method": "zstd", "rvz_level": 5, "rvz_chunk": 131072, "wbfs_scrub": True, "dolphintool": "", "wii_common_key": "", "wii_korean_key": "", "wii_warn_off": False, "art_dir": "", "title_cards": True, "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
@@ -4383,7 +4395,7 @@ class App:
         bf.pack(fill="x", padx=16, pady=(0, 14))
         ttk.Button(bf, text="Done", style="Accent.TButton", command=sw.withdraw).pack(side="right")
 
-        for key in ("compression", "custom_comp", "hunk", "threads", "verify_after", "low_priority", "delete_src",
+        for key in ("compression", "custom_comp", "hunk", "threads", "verify_after", "low_priority", "delete_src", "delete_forever",
                     "exists", "out_mode", "out_dir", "auto_suggest"):
             self.v[key].trace_add("write", lambda *a: self.refresh_summary())
         for key in ("dolphintool", "wii_common_key", "wii_korean_key", "wbfs_scrub"):
@@ -4442,18 +4454,21 @@ class App:
         row(f, 3, "If output exists", ttk.Combobox(f, textvariable=v["exists"], width=11, state="readonly",
                                                     values=["Skip", "Overwrite", "Rename"]))
         ttk.Checkbutton(f, text="Run chdman at low priority (keeps Windows responsive)", variable=v["low_priority"]).grid(
-            row=7, column=0, columnspan=2, sticky="w")
+            row=8, column=0, columnspan=2, sticky="w")
         ttk.Label(f, style="Muted.TLabel", wraplength=560, justify="left",
                   text="Tip: 'Fast' uses zlib only, the safest pick if an emulator rejects a CHD "
                        "(NetherSX2/AetherSX2 are reported to need zlib). 'None' makes full-size files, and chdman can't verify an uncompressed CHD.").grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(f, text="Verify each CHD after creating it", variable=v["verify_after"]).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(f, text="Send source files to the Recycle Bin after a VERIFIED CHD",
                         variable=v["delete_src"], command=self.on_delete_toggle).grid(
             row=5, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(f, text="Delete them permanently instead (frees the space at once; cannot be undone)",
+                        variable=v["delete_forever"], command=self.on_forever_toggle).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=(22, 0))
         ttk.Checkbutton(f, text="Auto-create a CUE for a lone .bin (assumes MODE2/2352, typical PS1)",
-                        variable=v["auto_cue"]).grid(row=6, column=0, columnspan=2, sticky="w")
+                        variable=v["auto_cue"]).grid(row=7, column=0, columnspan=2, sticky="w")
 
         # --- Formats (what each file becomes is chosen in its Action column; this tab only holds the extras)
         f = tab("Formats")
@@ -5087,7 +5102,7 @@ class App:
         if o["low_priority"]:
             parts.append("low priority")
         if o["delete_src"]:
-            parts.append("recycle originals after verify")
+            parts.append("delete originals for good after verify" if o["delete_forever"] else "recycle originals after verify")
         lead = "Suggested settings:  " if o["auto_suggest"] else "Settings:  "
         return lead + "  ·  ".join(parts)
 
@@ -5142,6 +5157,20 @@ class App:
                                           "and only after the new CHD has been created AND verified. "
                                           "Verification is turned on automatically.")
             self.v["verify_after"].set(True)
+
+    def on_forever_toggle(self):
+        """Ticking 'delete permanently' asks once; it also switches on the verified-delete option it belongs to."""
+        if not self.v["delete_forever"].get():
+            return
+        if not self.silent and not messagebox.askyesno(
+                APP_NAME, "Permanently delete the source files after each CHD is created and verified?\n\n"
+                          "They will NOT go to the Recycle Bin and cannot be restored. A source is only deleted once its "
+                          "new CHD has passed verification; a CHD that can't be verified never causes a delete.",
+                icon="warning", default="no"):
+            self.v["delete_forever"].set(False)
+            return
+        self.v["delete_src"].set(True)
+        self.v["verify_after"].set(True)
 
     def pick_out_dir(self):
         d = filedialog.askdirectory(title="Output folder")
@@ -5716,8 +5745,9 @@ class App:
             d[2] += n
         for near, free, n in drives.values():
             if n > 0 and free < n * 1.03 + SPACE_MARGIN:
+                bin_note = " Files in the Recycle Bin still use space until it is emptied." if o["delete_src"] and not o["delete_forever"] else ""
                 return (f"Not enough free space on {near.anchor or near}: about {fmt_size(n)} is needed there, "
-                        f"but only {fmt_size(free)} is free. Free up some room or choose another Output folder.")
+                        f"but only {fmt_size(free)} is free. Free up some room or choose another Output folder." + bin_note)
         return None
 
     def handle_exists(self, job, out, o):
@@ -5916,10 +5946,7 @@ class App:
             job.result += f" ({skipped} already existed)"
         self.post("log", f"OK  {job.path.name}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
         if o["delete_src"] and not skipped and not unverified:
-            if recycle(job.src_files):
-                self.post("log", f"Sent {len(job.src_files)} source file(s) to the Recycle Bin.", "ok")
-            else:
-                self.post("log", "Could not recycle the source file.", "warn")
+            self.remove_sources(job, o)
         elif o["delete_src"]:
             self.post("log", "The source file was kept (not everything could be verified, or part of it already existed).", "warn")
 
@@ -5988,10 +6015,19 @@ class App:
         if o["delete_src"] and unverified:
             self.post("log", "Source files were kept: an uncompressed CHD can't be verified, so nothing was recycled.", "warn")
         elif o["delete_src"]:
-            if recycle(job.src_files):
-                self.post("log", f"Sent {len(job.src_files)} source file(s) to the Recycle Bin.", "ok")
+            self.remove_sources(job, o)
+
+    def remove_sources(self, job, o):
+        """After a verified CHD: send the source files to the Recycle Bin, or delete them for good when the user chose that."""
+        if o.get("delete_forever"):
+            if delete_forever(job.src_files):
+                self.post("log", f"Deleted {len(job.src_files)} source file(s) permanently; the space is free again.", "ok")
             else:
-                self.post("log", "Could not recycle the source files.", "warn")
+                self.post("log", "Could not delete every source file.", "warn")
+        elif recycle(job.src_files):
+            self.post("log", f"Sent {len(job.src_files)} source file(s) to the Recycle Bin.", "ok")
+        else:
+            self.post("log", "Could not recycle the source files.", "warn")
 
     def verify_file(self, path, job, label):
         lines = []
