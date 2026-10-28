@@ -1469,6 +1469,134 @@ def extract_pbp_art(pbp, outdir):
     return made
 
 
+# A small 5x7 bitmap font (ASCII 32..126), one byte per column, bit 0 = top row. Drawn here, so the title cards need
+# no font file and nothing copyrighted.
+_FONT5X7 = bytes.fromhex(
+    "0000000000" "00005f0000" "0007000700" "147f147f14" "242a7f2a12" "2313086462" "3649552250" "0005030000"
+    "001c224100" "0041221c00" "14083e0814" "08083e0808" "0050300000" "0808080808" "0060600000" "2010080402"
+    "3e5149453e" "00427f4000" "4261514946" "2141454b31" "1814127f10" "2745454539" "3c4a494930" "0171090503"
+    "3649494936" "064949291e" "0036360000" "0056360000" "0814224100" "1414141414" "0041221408" "0201510906"
+    "324979413e" "7e1111117e" "7f49494936" "3e41414122" "7f4141221c" "7f49494941" "7f09090901" "3e4149497a"
+    "7f0808087f" "00417f4100" "2040413f01" "7f08142241" "7f40404040" "7f020c027f" "7f0408107f" "3e4141413e"
+    "7f09090906" "3e4151215e" "7f09192946" "4649494931" "01017f0101" "3f4040403f" "1f2040201f" "3f4038403f"
+    "6314081463" "0708700807" "6151494543" "007f414100" "0204081020" "00417f4100" "0402010204" "4040404040"
+    "0001020400" "2054545478" "7f48444438" "3844444420" "384444487f" "3854545418" "087e090102" "0c5252523e"
+    "7f08040478" "00447d4000" "2040443d00" "7f10284400" "00417f4000" "7c04180478" "7c08040478"
+    "3844444438" "7c14141408" "081414187c" "7c08040408" "4854545420" "043f444020" "3c4040207c" "1c2040201c"
+    "3c4030403c" "4428102844" "0c5050503c" "4464544c44" "0008364100" "00007f0000" "0041360800" "1008081008")
+
+_CARD_COLORS = ((200, 60, 60), (200, 120, 40), (180, 150, 30), (70, 160, 70), (40, 150, 150), (60, 110, 200),
+                (120, 80, 200), (180, 70, 160))
+
+
+def png_rgb(width, height, rows):
+    """A minimal PNG writer: rows is a list of `height` byte strings of `width` RGB pixels."""
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes(r) for r in rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _wrap_text(text, per_line):
+    lines, cur = [], ""
+    for word in text.split():
+        while len(word) > per_line:                # a word longer than a line is broken
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:per_line])
+            word = word[per_line:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= per_line:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def title_card(width, height, title, code, scales):
+    """A plain 'title card' PNG: a gradient in a colour taken from the game code, the title in white and the code below.
+    scales = the text sizes to try for the title, biggest first (the first one that fits is used)."""
+    seed = zlib.crc32((code or title).encode("ascii", "replace"))
+    r, g, b = _CARD_COLORS[seed % len(_CARD_COLORS)]
+    top, bot = (r // 3, g // 3, b // 3), (r // 8, g // 8, b // 8)
+    rows = []
+    for y in range(height):
+        t = y / max(1, height - 1)
+        px = bytes(int(top[i] + (bot[i] - top[i]) * t) for i in range(3))
+        rows.append(bytearray(px * width))
+    margin = max(4, width // 36)
+
+    def blit(x0, y0, ch, scale, color):
+        code_ = ord(ch) - 32 if 32 <= ord(ch) <= 126 else ord("?") - 32
+        cols = _FONT5X7[code_ * 5:code_ * 5 + 5]
+        for cx, col in enumerate(cols):
+            for ry in range(7):
+                if col >> ry & 1:
+                    for dy in range(scale):
+                        y = y0 + ry * scale + dy
+                        if 0 <= y < height:
+                            for dx in range(scale):
+                                x = x0 + cx * scale + dx
+                                if 0 <= x < width:
+                                    rows[y][x * 3:x * 3 + 3] = bytes(color)
+
+    def draw(lines, scale, top_y, color):
+        step = 8 * scale + scale
+        for i, line in enumerate(lines):
+            w = len(line) * 6 * scale - scale
+            x = (width - w) // 2
+            for k, ch in enumerate(line):
+                blit(x + k * 6 * scale, top_y + i * step, ch, scale, color)
+
+    text = re.sub(r"\s+", " ", title.encode("ascii", "replace").decode("ascii")).strip().upper() or "?"
+    code = (code or "").strip().upper()
+    code_scale = max(1, scales[-1])
+    code_h = (8 * code_scale) + margin if code else 0
+    avail_h, avail_w = height - 2 * margin - code_h, width - 2 * margin
+    chosen = None
+    for sc in scales:
+        lines = _wrap_text(text, max(1, (avail_w + sc) // (6 * sc)))
+        if len(lines) * (9 * sc) - sc <= avail_h and all(len(l) * 6 * sc - sc <= avail_w for l in lines):
+            chosen = (sc, lines)
+            break
+    if not chosen:                                   # too long even at the smallest size: cut it
+        sc = scales[-1]
+        per = max(1, (avail_w + sc) // (6 * sc))
+        fit = max(1, (avail_h + sc) // (9 * sc))
+        lines = _wrap_text(text, per)[:fit]
+        lines[-1] = lines[-1][:max(0, per - 3)].rstrip() + "..."
+        chosen = (sc, lines)
+    sc, lines = chosen
+    block = len(lines) * 9 * sc - sc
+    y0 = margin + max(0, (avail_h - block) // 2)
+    draw(lines, sc, y0, (255, 255, 255))
+    if code:
+        bar_y = height - margin - code_h + margin // 2
+        for y in range(bar_y - 2, bar_y - 2 + max(1, code_scale)):          # a coloured line above the code
+            if 0 <= y < height:
+                rows[y][margin * 3:(width - margin) * 3] = bytes((r, g, b)) * (width - 2 * margin)
+        draw([code], code_scale, bar_y + 3, (r + (255 - r) // 2, g + (255 - g) // 2, b + (255 - b) // 2))
+    return png_rgb(width, height, rows)
+
+
+def make_title_art(title, game_id, have=()):
+    """ICON0 (144x80) and PIC1 (480x272) title cards for a PBP, for the pictures not in `have`.
+    game_id like SLUS00594 is shown as SLUS-00594."""
+    code = f"{game_id[:4]}-{game_id[4:]}" if re.fullmatch(r"[A-Z]{4}\d{5}", game_id or "") else (game_id or "")
+    art = {}
+    if "icon0" not in have:
+        art["icon0"] = title_card(144, 80, title, code, (2, 1))
+    if "pic1" not in have:
+        art["pic1"] = title_card(480, 272, title, code, (6, 5, 4, 3, 2))
+    return art
+
+
 def read_base_pbp(path):
     """The parts of a working PS1 .pbp that a PSP needs and that can't be made from a disc: the loader (DATA.PSP),
     the icon and pictures, and the boot-logo block (STARTDAT) that follows the disc data."""
@@ -2328,7 +2456,7 @@ DEFAULTS = {
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
     "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
-    "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "art_dir": "", "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
+    "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "art_dir": "", "title_cards": True, "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
 
 
@@ -2648,6 +2776,10 @@ class App:
         ttk.Label(nf, text="Output file name (%FILENAME% %GAMEID% %TITLE% %REGION%):").grid(row=0, column=0, sticky="w")
         ttk.Entry(nf, textvariable=v["name_format"], width=34).grid(row=0, column=1, padx=6)
         ttk.Button(nf, text="Get game titles…", command=self.download_gamedb_ui).grid(row=0, column=2)
+        tf = ttk.Frame(f)
+        tf.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(tf, text="Draw a title card (game name and code) for PBPs that have no artwork of your own",
+                        variable=v["title_cards"]).grid(row=0, column=0, sticky="w")
         pf = ttk.Frame(f)
         pf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Label(pf, text="PBP compression (0 = none, 9 = smallest):").grid(row=0, column=0, sticky="w")
@@ -4377,6 +4509,20 @@ class App:
                 return art
         return None
 
+    def pbp_art(self, o, stem, game_id, title):
+        """The artwork for a new PBP: yours where you have it, and for the icon and background you don't have, a plain
+        title card with the game's name and code, so the game can be told apart in the PSP menu."""
+        art = self.find_art(o, stem, game_id, title) or {}
+        if o.get("title_cards"):
+            dbf = find_gamedb()
+            ent = load_gamedb(dbf).get(game_id) if dbf else None
+            shown = (ent["main_title"] or ent["title"]) if ent else title
+            made = make_title_art(shown, game_id, art)
+            if made:
+                self.post("log", f"Drew title cards for the PSP menu ({', '.join(k.upper() for k in made)}): {shown}.", "info")
+            art = {**made, **art}
+        return art or None
+
     def do_extract_art(self, job, o):
         """PBP -> its icon, pictures and sound as files (into the artwork folder when one is set, so they are picked up again)."""
         root = o.get("art_dir")
@@ -4540,7 +4686,7 @@ class App:
             title = re.sub(r"\s*\[[^\]]*\]", "", title).strip() or out.stem
             try:
                 write_pbp(part, layouts, ids, title, lambda x: prog("Writing PBP", x), lambda: self.stop_flag, donor=donor,
-                          level=o["pbp_level"], art=self.find_art(o, out.stem, ids[0], title))
+                          level=o["pbp_level"], art=self.pbp_art(o, out.stem, ids[0], title))
                 if o["verify_after"]:
                     if not verify_pbp(part, layouts, lambda x: prog("Verifying", x), lambda: self.stop_flag):
                         return fail("Verify failed", "the finished PBP didn't match the disc it was made from; it was discarded.")
