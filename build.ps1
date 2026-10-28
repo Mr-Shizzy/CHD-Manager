@@ -74,7 +74,7 @@ if ($ChdmanPath) {
 # ---- 4. exe
 Write-Host "Building the exe..."
 & python -m PyInstaller --noconfirm --clean --onefile --windowed --name "CHD Manager" `
-    --icon "$root\assets\icon.ico" --add-data "${chdman};." `
+    --icon "$root\assets\icon.ico" --add-data "${chdman};." --hidden-import zstandard --hidden-import zstandard.backend_c `
     --distpath "$root\build\exe" --workpath "$root\build\work" --specpath "$root\build" "$root\CHD_Manager.pyw"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$root\build\exe\CHD Manager.exe")) { Fail "PyInstaller failed." }
 

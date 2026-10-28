@@ -11,9 +11,12 @@ What it does
   * Verify after create; optional "send sources to Recycle Bin" ONLY after a verified CHD
   * Live progress, log, summary of space saved
 """
+import bisect
+import bz2
 import ctypes
 import hashlib
 import json
+import lzma
 import os
 import platform
 import queue
@@ -42,7 +45,7 @@ SETTINGS_FILE = HERE / "chd_manager_settings.json"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 CD_MAX_BYTES = 737_280_000          # 80-minute CD: 360,000 sectors * 2048 bytes
-SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".sub", ".m3u", ".cso"}
+SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".sub", ".m3u", ".cso", ".zso", ".ecm", ".gcm", ".gcz", ".rvz", ".wia", ".wbfs", ".ciso", ".wux", ".wud"}
 ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz"}
 CHDMAN = None                        # path to chdman.exe, set at startup
 
@@ -1228,9 +1231,11 @@ def _edc(data):
 
 
 def fix_sector(s):
-    """A raw Mode 2 Form 1 sector with its EDC and ECC recomputed from its own data (header and subheader kept).
-    Any other kind of sector (audio, Form 2, Mode 1) is returned as it was."""
+    """A raw Mode 1 or Mode 2 Form 1 sector with its EDC and ECC recomputed from its own data (header and subheader kept).
+    Any other kind of sector (audio, Form 2) is returned as it was."""
     import operator
+    if len(s) == 2352 and s[:12] == b"\x00" + b"\xff" * 10 + b"\x00" and s[15] == 1:
+        return mode1_sector(s[12:15], s[16:2064])
     if len(s) != 2352 or s[:12] != b"\x00" + b"\xff" * 10 + b"\x00" or s[15] != 2 or s[18] & 0x20 or s[22] & 0x20:
         return s
     _ecc_setup()
@@ -1274,6 +1279,1579 @@ def sniff_raw_image(path):
     if len(h) == 16 and h[:12] == b"\x00" + b"\xff" * 10 + b"\x00" and h[15] in (1, 2):
         return f"MODE{h[15]}/2352"
     return ""
+
+
+# ------------------------------------------------------------------ Mode 1 sectors, ECM, LZ4
+_SYNC = b"\x00" + b"\xff" * 10 + b"\x00"
+_EDC_T1 = None
+
+
+def _edc_crc(c, data):
+    """Continue the CD EDC checksum c over data (any length); start from 0."""
+    global _EDC_T1
+    _ecc_setup()
+    n = len(data) & ~1
+    if n:
+        for w in struct.unpack("<%dH" % (n // 2), data[:n]):
+            c ^= w
+            c = _EDC_T2[c & 0xFFFF] ^ (c >> 16)
+    if len(data) > n:
+        if _EDC_T1 is None:
+            t1 = []
+            for i in range(256):
+                x = i
+                for _ in range(8):
+                    x = (x >> 1) ^ (0xD8018001 if x & 1 else 0)
+                t1.append(x)
+            _EDC_T1 = t1
+        for b in data[n:]:
+            c = (c >> 8) ^ _EDC_T1[(c ^ b) & 0xFF]
+    return c
+
+
+def _pq(src):
+    """P and Q parity (172 + 104 bytes) of the 2064 bytes a sector's ECC covers."""
+    import operator
+    _ecc_setup()
+    p = _ecc_parity(src, _ECC_P_TABLES, 86)
+    return p + _ecc_parity(bytes(operator.itemgetter(*_ECC_Q_PERM)(src + p)), _ECC_Q_TABLES, 52)
+
+
+def mode1_sector(addr, user):
+    """A full 2352-byte Mode 1 sector from its 3 address bytes and 2048 bytes of data: sync, header, EDC, ECC."""
+    body = bytearray(_SYNC) + bytes(addr) + b"\x01" + user
+    body += struct.pack("<I", _edc_crc(0, bytes(body))) + bytes(8)
+    return bytes(body) + _pq(bytes(body[12:2076]))
+
+
+def xa_body(flags_data, form2=False):
+    """The 2336 bytes after the header of a Mode 2 sector: flags (4 bytes + the same again), data, EDC and (Form 1) ECC.
+    flags_data = the 4 flag bytes followed by 2048 (Form 1) or 2324 (Form 2) bytes of data."""
+    body = bytearray(flags_data[:4] + flags_data)
+    body += struct.pack("<I", _edc_crc(0, bytes(body)))
+    if form2:
+        return bytes(body)
+    return bytes(body) + _pq(bytes(4) + bytes(body))         # the address counts as zero in a Mode 2 sector's ECC
+
+
+def ecm_head(typ, num):
+    """The type/count bytes of an ECM record (num >= 1)."""
+    num -= 1
+    c = typ | ((num & 0x1F) << 2)
+    num >>= 5
+    out = bytearray()
+    while num:
+        out.append(c | 0x80)
+        c = num & 0x7F
+        num >>= 7
+    out.append(c)
+    return bytes(out)
+
+
+def ecm_decode(src, dst, progress, stopped):
+    """ECM (Neill Corlett's error-code-modeler format) -> the original CD image. -> the track type to put in a CUE:
+    'MODE1/2352', 'MODE2/2352', 'MODE2/2336' or ''. The checksum stored at the end of the file is checked."""
+    total = max(1, os.path.getsize(src))
+    crc, first, done = 0, b"", 0
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        if f.read(4) != b"ECM\x00":
+            raise UnpackError("this is not an ECM file")
+
+        def need(n):
+            b = f.read(n)
+            if len(b) != n:
+                raise UnpackError("the ECM file is cut short")
+            return b
+        while True:
+            c = need(1)[0]
+            typ, num, bits = c & 3, (c >> 2) & 0x1F, 5
+            while c & 0x80:
+                c = need(1)[0]
+                num |= (c & 0x7F) << bits
+                bits += 7
+            if num == 0xFFFFFFFF:
+                break
+            num += 1
+            if typ == 0:
+                while num:
+                    chunk = need(min(num, 1 << 20))
+                    if len(first) < 16:
+                        first += chunk[:16]
+                    g.write(chunk)
+                    crc = _edc_crc(crc, chunk)
+                    num -= len(chunk)
+            else:
+                for _ in range(num):
+                    if typ == 1:
+                        a = need(3)
+                        sec = mode1_sector(a, need(2048))
+                    elif typ == 2:
+                        sec = xa_body(need(2052))
+                    else:
+                        sec = xa_body(need(2328), True)
+                    if len(first) < 16:
+                        first += sec[:16] if typ == 1 else b""
+                    g.write(sec)
+                    crc = _edc_crc(crc, sec)
+                    done += 1
+                    if done % 256 == 0:
+                        progress(f.tell() / total)
+                        if stopped():
+                            raise UnpackError("stopped")
+            progress(f.tell() / total)
+            if stopped():
+                raise UnpackError("stopped")
+        if struct.unpack("<I", need(4))[0] != crc:
+            raise UnpackError("the ECM file is damaged (its checksum doesn't match)")
+        size = g.tell()
+    progress(1.0)
+    if len(first) >= 16 and first[:12] == _SYNC and first[15] in (1, 2) and size % 2352 == 0:
+        return f"MODE{first[15]}/2352"
+    return "MODE2/2336" if size and size % 2336 == 0 else ""
+
+
+def ecm_encode(src, dst, progress, stopped):
+    """A raw 2352-byte-sector CD image -> ECM. Mode 1 sectors and Mode 2 Form 1/Form 2 sectors that carry correct EDC/ECC
+    lose those bytes; everything else is stored as it is."""
+    total = os.path.getsize(src)
+    n = max(1, total // 2352)
+    crc = 0
+    state = {"typ": None, "count": 0, "parts": [], "bytes": 0}
+
+    def flush(g):
+        if state["typ"] is None:
+            return
+        g.write(ecm_head(state["typ"], state["bytes"] if state["typ"] == 0 else state["count"]))
+        g.write(b"".join(state["parts"]))
+        state.update(typ=None, count=0, parts=[], bytes=0)
+
+    def add(g, typ, payload):
+        if state["typ"] != typ or state["bytes"] > (1 << 22) or state["count"] >= (1 << 16):
+            flush(g)
+        state["typ"] = typ
+        state["parts"].append(payload)
+        state["bytes"] += len(payload)
+        state["count"] += 1
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        g.write(b"ECM\x00")
+        for i in range(n + 1):
+            s = f.read(2352)
+            if not s:
+                break
+            crc = _edc_crc(crc, s)
+            if len(s) == 2352 and s[:12] == _SYNC and s[15] == 1 and mode1_sector(s[12:15], s[16:2064]) == s:
+                add(g, 1, s[12:15] + s[16:2064])
+            elif len(s) == 2352 and s[:12] == _SYNC and s[15] == 2 and s[16:20] == s[20:24] and not s[18] & 0x20 \
+                    and xa_body(s[20:2072]) == s[16:]:
+                add(g, 0, s[:16])
+                add(g, 2, s[20:2072])
+            elif len(s) == 2352 and s[:12] == _SYNC and s[15] == 2 and s[16:20] == s[20:24] and s[18] & 0x20 \
+                    and xa_body(s[20:2348], True) == s[16:]:
+                add(g, 0, s[:16])
+                add(g, 3, s[20:2348])
+            else:
+                add(g, 0, s)
+            if i % 256 == 0:
+                progress(i / n)
+                if stopped():
+                    raise UnpackError("stopped")
+        flush(g)
+        g.write(ecm_head(0, 0x100000000) + struct.pack("<I", crc))
+    progress(1.0)
+
+
+def verify_ecm(ecm, image, progress, stopped):
+    """True when the ECM file decodes to exactly this image."""
+    tmp = Path(tempfile.mkdtemp(prefix="chdm_ecm_"))
+    try:
+        out = tmp / "t.bin"
+        ecm_decode(ecm, out, progress, stopped)
+        return out.stat().st_size == Path(image).stat().st_size and files_equal(out, image)
+    except UnpackError:
+        if stopped():
+            raise
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def files_equal(a, b):
+    with open(a, "rb") as f, open(b, "rb") as g:
+        while True:
+            x, y = f.read(1 << 22), g.read(1 << 22)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def lz4_decompress(src, size):
+    """One LZ4 block -> exactly `size` bytes (extra bytes after the block are ignored)."""
+    out, i = bytearray(), 0
+    try:
+        while len(out) < size:
+            tok = src[i]
+            i += 1
+            ll = tok >> 4
+            if ll == 15:
+                while True:
+                    b = src[i]
+                    i += 1
+                    ll += b
+                    if b != 255:
+                        break
+            out += src[i:i + ll]
+            i += ll
+            if len(out) >= size:
+                break
+            off = src[i] | src[i + 1] << 8
+            i += 2
+            ml = tok & 15
+            if ml == 15:
+                while True:
+                    b = src[i]
+                    i += 1
+                    ml += b
+                    if b != 255:
+                        break
+            ml += 4
+            if off == 0 or off > len(out):
+                raise ValueError
+            start = len(out) - off
+            if off >= ml:
+                out += out[start:start + ml]
+            else:
+                seg = bytes(out[start:])
+                out += (seg * (ml // off + 1))[:ml]
+    except (IndexError, ValueError):
+        raise UnpackError("a block of this ZSO is damaged") from None
+    return bytes(out[:size])
+
+
+def lz4_compress(data):
+    """One LZ4 block (greedy matching; valid for any LZ4 decoder)."""
+    n = len(data)
+    out = bytearray()
+
+    def seq(lits, off, ml):
+        ll = len(lits)
+        out.append(min(ll, 15) << 4 | (min(ml - 4, 15) if off else 0))
+        if ll >= 15:
+            r = ll - 15
+            while r >= 255:
+                out.append(255)
+                r -= 255
+            out.append(r)
+        out.extend(lits)
+        if off:
+            out.extend((off & 255, off >> 8))
+            if ml - 4 >= 15:
+                r = ml - 4 - 15
+                while r >= 255:
+                    out.append(255)
+                    r -= 255
+                out.append(r)
+    anchor = i = 0
+    table = {}
+    while i <= n - 12:
+        key = data[i:i + 4]
+        cand = table.get(key)
+        table[key] = i
+        if cand is not None and i - cand <= 65535:
+            m, maxm = 4, n - 5 - i
+            while m + 8 <= maxm and data[cand + m:cand + m + 8] == data[i + m:i + m + 8]:
+                m += 8
+            while m < maxm and data[cand + m] == data[i + m]:
+                m += 1
+            seq(data[anchor:i], i - cand, m)
+            i += m
+            anchor = i
+        else:
+            i += 1
+    seq(data[anchor:n], 0, 0)
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ GameCube / Wii disc images (ISO, WBFS, CISO, GCZ, WIA, RVZ)
+# The WIA/RVZ, GCZ, CISO and WBFS layouts and the lagged-Fibonacci "junk" generator follow the Dolphin emulator's
+# DiscIO code (GPL-2.0-or-later), re-written here in Python.
+GC_MAGIC, WII_MAGIC = 0xC2339F3D, 0x5D1C9EA3
+WII_ISO_SL, WII_ISO_DL = 4699979776, 8511160320
+CL, CLD = 0x8000, 0x7C00                        # a Wii cluster, and the part of it that is data (the rest is hashes)
+GCZ_MAGIC = b"\x01\xc0\x0b\xb1"
+_BC = None
+
+
+def _bcrypt():
+    global _BC
+    if _BC is None:
+        c = ctypes
+        dll = c.WinDLL("bcrypt")
+        P, V, U = c.POINTER, c.c_void_p, c.c_ulong
+        dll.BCryptOpenAlgorithmProvider.argtypes = [P(V), c.c_wchar_p, c.c_wchar_p, U]
+        dll.BCryptSetProperty.argtypes = [V, c.c_wchar_p, V, U, U]
+        dll.BCryptGenerateSymmetricKey.argtypes = [V, P(V), V, U, c.c_char_p, U, U]
+        for fn in (dll.BCryptEncrypt, dll.BCryptDecrypt):
+            fn.argtypes = [V, c.c_char_p, U, V, V, U, V, U, P(U), U]
+        _BC = dll
+    return _BC
+
+
+class AesCbc:
+    """AES-128 in CBC mode through Windows' own crypto library (no extra package needed)."""
+
+    def __init__(self, key):
+        dll = _bcrypt()
+        self.dll = dll
+        alg = ctypes.c_void_p()
+        if dll.BCryptOpenAlgorithmProvider(ctypes.byref(alg), "AES", None, 0):
+            raise UnpackError("Windows' AES library isn't available")
+        mode = ctypes.create_unicode_buffer("ChainingModeCBC")
+        dll.BCryptSetProperty(alg, "ChainingMode", ctypes.cast(mode, ctypes.c_void_p), ctypes.sizeof(mode), 0)
+        self.key = ctypes.c_void_p()
+        dll.BCryptGenerateSymmetricKey(alg, ctypes.byref(self.key), None, 0, bytes(key), 16, 0)
+
+    def crypt(self, data, iv=bytes(16), decrypt=False):
+        n = len(data)
+        out = ctypes.create_string_buffer(n)
+        res = ctypes.c_ulong()
+        ivb = ctypes.create_string_buffer(bytes(iv), 16)
+        fn = self.dll.BCryptDecrypt if decrypt else self.dll.BCryptEncrypt
+        if fn(self.key, bytes(data), n, None, ivb, 16, out, n, ctypes.byref(res), 0):
+            raise UnpackError("AES failed")
+        return out.raw
+
+
+# ---- the lagged-Fibonacci generator that fills the unused parts of GameCube and Wii discs
+def lfg_forward(buf):
+    """Advance the 521-word state (a bytearray of 2084 bytes) by one full turn."""
+    fb = int.from_bytes
+    buf[0:128] = (fb(buf[0:128], "little") ^ fb(buf[1956:2084], "little")).to_bytes(128, "little")
+    for k in range(128, 2048, 128):
+        buf[k:k + 128] = (fb(buf[k:k + 128], "little") ^ fb(buf[k - 128:k], "little")).to_bytes(128, "little")
+    buf[2048:2084] = (fb(buf[2048:2084], "little") ^ fb(buf[1920:1956], "little")).to_bytes(36, "little")
+
+
+def lfg_backward(buf, start_word=0, end_word=521):
+    """The inverse of lfg_forward over the words start_word..end_word (the whole state by default)."""
+    fb = int.from_bytes
+    hi = min(end_word, 521)
+    stop = max(32, start_word)
+    while hi > stop:
+        lo = max(hi - 32, stop)
+        a, b = lo * 4, hi * 4
+        buf[a:b] = (fb(buf[a:b], "little") ^ fb(buf[a - 128:b - 128], "little")).to_bytes(b - a, "little")
+        hi = lo
+    top = min(end_word, 32)
+    if top > start_word:
+        a, b = start_word * 4, top * 4
+        buf[a:b] = (fb(buf[a:b], "little") ^ fb(buf[a + 1956:b + 1956], "little")).to_bytes(b - a, "little")
+
+
+def _lfg_load(words):
+    """521 seed-expanded words -> the generator state (the output shuffle is applied here, as Dolphin does)."""
+    buf = bytearray(struct.pack(">521I", *[(x & 0xFF00FFFF) | ((x >> 2) & 0x00FF0000) for x in words]))
+    for _ in range(4):
+        lfg_forward(buf)
+    return buf
+
+
+def _lfg_expand(seed_words):
+    w = list(seed_words) + [0] * 504
+    for i in range(17, 521):
+        w[i] = ((w[i - 17] << 23) & 0xFFFFFFFF) ^ (w[i - 16] >> 9) ^ w[i - 1]
+    return w
+
+
+class Lfg:
+    def __init__(self, seed68, skip=0):
+        self.buf = _lfg_load(_lfg_expand(struct.unpack(">17I", seed68)))
+        self.pos = 0
+        self.skip(skip)
+
+    def skip(self, n):
+        self.pos += n
+        while self.pos >= 2084:
+            lfg_forward(self.buf)
+            self.pos -= 2084
+
+    def get(self, n):
+        out = []
+        while n > 0:
+            take = min(n, 2084 - self.pos)
+            out.append(bytes(self.buf[self.pos:self.pos + take]))
+            self.pos += take
+            n -= take
+            if self.pos == 2084:
+                lfg_forward(self.buf)
+                self.pos = 0
+        return b"".join(out)
+
+
+def lfg_find_seed(data, word_offset):
+    """The seed of the generator that produced `data` (>= 521 words, starting `word_offset` words into the stream), or None."""
+    if len(data) < 2084:
+        return None
+    words = struct.unpack(">521I", data[:2084])
+    for x in words:
+        if (x & 0x00C00000) != ((x >> 2) & 0x00C00000):
+            return None
+    mod, div = word_offset % 521, word_offset // 521
+    buf = bytearray(2084)
+    # the words as the generator holds them (output shuffle already applied, i.e. the bytes as they appear on disc)
+    buf[mod * 4:] = data[:(521 - mod) * 4]
+    buf[:mod * 4] = data[(521 - mod) * 4:2084]
+    lfg_backward(buf, 0, mod)
+    for _ in range(div):
+        lfg_backward(buf)
+    for _ in range(4):
+        lfg_backward(buf)
+    w = list(struct.unpack(">521I", bytes(buf)))
+    # undo the shuffle: bits 16 and 17 are rebuilt from neighbouring words
+    for i in range(17):
+        w[i] = (w[i] & 0xFF00FFFF) | ((w[i] << 2) & 0x00FC0000) | (((w[i + 16] ^ w[i + 15]) << 9) & 0x00030000)
+    seed = struct.pack(">17I", *w[:17])
+    for i in range(17, 521):
+        calc = ((w[i - 17] << 23) & 0xFFFFFFFF) ^ (w[i - 16] >> 9) ^ w[i - 1]
+        if (calc & 0xFFFCFFFF) != ((w[i] & 0xFF00FFFF) | ((w[i] << 2) & 0x00FC0000)):
+            return None
+        w[i] = calc
+    return seed
+
+
+def common_prefix(a, b):
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, step = 0, 4096
+    while lo + step <= n and a[lo:lo + step] == b[lo:lo + step]:
+        lo += step
+    while lo < n and a[lo] == b[lo]:
+        lo += 1
+    return lo
+
+
+def rvz_unpack(buf, data_offset):
+    """Undo RVZ packing: (size, bytes) pieces, or (size | 0x80000000, 68-byte seed) pieces of generated junk."""
+    out, i, n = [], 0, len(buf)
+    produced = 0
+    while i < n:
+        size = struct.unpack_from(">I", buf, i)[0]
+        i += 4
+        if size & 0x80000000:
+            size &= 0x7FFFFFFF
+            seed = bytes(buf[i:i + 68])
+            i += 68
+            out.append(Lfg(seed, (data_offset + produced) % CL).get(size))
+        else:
+            out.append(bytes(buf[i:i + size]))
+            i += size
+        produced += size
+    return b"".join(out)
+
+
+# ---- reading the containers: every one of them presents the disc as the bytes of the ISO
+class DiscImage:
+    size = 0
+    kind = "ISO"
+
+    def read(self, off, n):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+    def info(self):
+        h = self.read(0, 0x60)
+        if h[:4] == b"WUP-":                                  # Wii U: "WUP-P-ARPE-02-10" (product code, version)
+            return dict(platform="Wii U", id=h[6:10].decode("ascii", "replace"), title="")
+        wii = struct.unpack(">I", h[0x18:0x1C])[0] == WII_MAGIC
+        gc = struct.unpack(">I", h[0x1C:0x20])[0] == GC_MAGIC
+        return dict(platform="Wii" if wii else "GameCube" if gc else "", id=h[:6].decode("ascii", "replace"),
+                    title=h[0x20:0x60].split(b"\0")[0].decode("ascii", "replace").strip())
+
+
+class IsoDisc(DiscImage):
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.size = os.path.getsize(path)
+
+    def read(self, off, n):
+        self.f.seek(off)
+        return self.f.read(n).ljust(n, b"\0") if off < self.size else bytes(n)
+
+    def close(self):
+        self.f.close()
+
+
+class WuxDisc(DiscImage):
+    """Wii U disc compressed with WUX: a table of sector numbers, then each different sector once."""
+    kind = "WUX"
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        h = self.f.read(24)
+        if len(h) < 24 or struct.unpack("<II", h[:8]) != (0x30585557, 0x1099D02E):
+            raise UnpackError("this is not a WUX file")
+        self.ss, _, self.size = struct.unpack("<IIQ", h[8:24])
+        if self.ss < 0x100 or self.ss >= 0x10000000:
+            raise UnpackError("this WUX file has an odd sector size")
+        n = (self.size + self.ss - 1) // self.ss
+        self.idx = struct.unpack("<%dI" % n, self.f.read(4 * n))
+        self.base = (24 + 4 * n + self.ss - 1) // self.ss * self.ss
+
+    def read(self, off, n):
+        out, want = [], n
+        while n > 0 and off < self.size:
+            i, inb = divmod(off, self.ss)
+            run = 1                                           # neighbouring sectors that are stored next to each other
+            while run * self.ss - inb < n and i + run < len(self.idx) and self.idx[i + run] == self.idx[i] + run:
+                run += 1
+            take = min(n, run * self.ss - inb, self.size - off)
+            self.f.seek(self.base + self.idx[i] * self.ss + inb)
+            out.append(self.f.read(take))
+            off += take
+            n -= take
+        return b"".join(out).ljust(want, b"\0")
+
+    def close(self):
+        self.f.close()
+
+
+def write_wux(disc, dst, progress, stopped, sector=0x8000):
+    """A Wii U disc -> WUX: each different 32 KiB sector is stored once and a table says where every sector of the disc is."""
+    n = (disc.size + sector - 1) // sector
+    base = (24 + 4 * n + sector - 1) // sector * sector
+    index, seen = [0] * n, {}
+    with open(dst, "wb") as g:
+        g.seek(base)
+        step = 128
+        for a in range(0, n, step):
+            chunk = disc.read(a * sector, step * sector)
+            for k in range(min(step, n - a)):
+                s = chunk[k * sector:(k + 1) * sector]
+                d = hashlib.sha1(s).digest()
+                u = seen.get(d)
+                if u is None:
+                    u = seen[d] = len(seen)
+                    g.write(s)
+                index[a + k] = u
+            progress(min(1.0, (a + step) / n))
+            if stopped():
+                raise UnpackError("stopped")
+        g.seek(0)
+        g.write(struct.pack("<IIIIQ", 0x30585557, 0x1099D02E, sector, 0, disc.size) + struct.pack("<%dI" % n, *index))
+    progress(1.0)
+
+
+class WbfsDisc(DiscImage):
+    kind = "WBFS"
+
+    def __init__(self, path):
+        p = Path(path)
+        self.files = [open(p, "rb")]
+        for i in range(1, 10):                          # .wbf1, .wbf2 ... when the file was split for FAT32
+            q = p.with_suffix(p.suffix[:-1] + str(i))
+            if not q.is_file():
+                break
+            self.files.append(open(q, "rb"))
+        self.sizes = [os.fstat(f.fileno()).st_size for f in self.files]
+        f = self.files[0]
+        head = f.read(12)
+        if head[:4] != b"WBFS":
+            raise UnpackError("this is not a WBFS file")
+        n_sec, hd_shift, wb_shift = struct.unpack(">IBB", head[4:10])
+        self.hd, self.wb = 1 << hd_shift, 1 << wb_shift
+        if sum(self.sizes) != n_sec * self.hd or self.wb < CL:
+            raise UnpackError("this WBFS file is damaged or cut short")
+        per_disc = (143432 * 2 * CL + self.wb - 1) // self.wb
+        f.seek(self.hd + 256)
+        self.wlba = struct.unpack(">%dH" % per_disc, f.read(2 * per_disc))
+        used = [i for i, v in enumerate(self.wlba) if v]
+        end = (used[-1] + 1) * self.wb if used else 0
+        self.size = WII_ISO_SL if end <= WII_ISO_SL else WII_ISO_DL
+
+    def _pread(self, pos, n):
+        for f, sz in zip(self.files, self.sizes):
+            if pos < sz:
+                f.seek(pos)
+                got = f.read(min(n, sz - pos))
+                return got + (self._pread(pos + len(got), n - len(got)) if len(got) < n else b"")
+            pos -= sz
+        return b""
+
+    def read(self, off, n):
+        out = []
+        while n > 0:
+            blk, inb = divmod(off, self.wb)
+            take = min(n, self.wb - inb)
+            lba = self.wlba[blk] if blk < len(self.wlba) else 0
+            out.append(self._pread(lba * self.wb + inb, take).ljust(take, b"\0") if lba else bytes(take))
+            off += take
+            n -= take
+        return b"".join(out)
+
+    def close(self):
+        for f in self.files:
+            f.close()
+
+
+class CisoDisc(DiscImage):
+    kind = "CISO"
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        h = self.f.read(0x8000)
+        if len(h) < 0x8000 or h[:4] != b"CISO":
+            raise UnpackError("this is not a GameCube/Wii CISO file")
+        self.block = struct.unpack("<I", h[4:8])[0]
+        self.pos, count = [], 0
+        for v in h[8:]:
+            self.pos.append(count if v == 1 else None)
+            count += v == 1
+        last = max((i for i, v in enumerate(self.pos) if v is not None), default=-1)
+        self.size = (last + 1) * self.block
+
+    def read(self, off, n):
+        out = []
+        while n > 0:
+            blk, inb = divmod(off, self.block)
+            take = min(n, self.block - inb)
+            p = self.pos[blk] if blk < len(self.pos) else None
+            if p is None:
+                out.append(bytes(take))
+            else:
+                self.f.seek(0x8000 + p * self.block + inb)
+                out.append(self.f.read(take).ljust(take, b"\0"))
+            off += take
+            n -= take
+        return b"".join(out)
+
+    def close(self):
+        self.f.close()
+
+
+class GczDisc(DiscImage):
+    kind = "GCZ"
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        h = self.f.read(32)
+        if h[:4] != GCZ_MAGIC:
+            raise UnpackError("this is not a GCZ file")
+        self.sub, self.csize, self.size, self.block, n = struct.unpack("<IQQII", h[4:32])
+        self.ptr = struct.unpack("<%dQ" % n, self.f.read(8 * n))
+        self.hash = struct.unpack("<%dI" % n, self.f.read(4 * n))
+        self.base = 32 + 12 * n
+        self.last = (None, b"")
+
+    def _block(self, i):
+        if self.last[0] == i:
+            return self.last[1]
+        p = self.ptr[i]
+        raw_flag = p >> 63
+        start = p & 0x7FFFFFFFFFFFFFFF
+        end = (self.ptr[i + 1] & 0x7FFFFFFFFFFFFFFF) if i + 1 < len(self.ptr) else self.csize
+        self.f.seek(self.base + start)
+        raw = self.f.read(end - start)
+        if zlib.adler32(raw) != self.hash[i]:
+            raise UnpackError(f"the GCZ file is damaged (block {i})")
+        data = raw if raw_flag else zlib.decompress(raw)
+        self.last = (i, data)
+        return data
+
+    def read(self, off, n):
+        out, want = [], n
+        while n > 0 and off < self.size:
+            blk, inb = divmod(off, self.block)
+            data = self._block(blk)
+            take = min(n, len(data) - inb, self.size - off)
+            out.append(data[inb:inb + take])
+            off += take
+            n -= take
+        return b"".join(out).ljust(want, b"\0")
+
+    def close(self):
+        self.f.close()
+
+
+def _purge_decode(data, size):
+    out = bytearray(size)
+    i = 0
+    while i + 8 <= len(data) - 20:
+        o, s = struct.unpack_from(">II", data, i)
+        out[o:o + s] = data[i + 8:i + 8 + s]
+        i += 8 + s
+    return bytes(out)
+
+
+class RvzDisc(DiscImage):
+    """WIA and RVZ files."""
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        h1 = self.f.read(0x48)
+        magic = h1[:4]
+        if magic not in (b"WIA\x01", b"RVZ\x01"):
+            raise UnpackError("this is not a WIA or RVZ file")
+        self.rvz = magic == b"RVZ\x01"
+        self.kind = "RVZ" if self.rvz else "WIA"
+        h2size = struct.unpack(">I", h1[12:16])[0]
+        self.size, fsize = struct.unpack(">QQ", h1[36:52])
+        h2 = self.f.read(h2size)
+        if hashlib.sha1(h1[:52]).digest() != h1[52:72] or hashlib.sha1(h2).digest() != h1[16:36]:
+            raise UnpackError("the file's header checksums don't match; it is damaged")
+        if fsize != os.path.getsize(path):
+            raise UnpackError("the file is cut short")
+        self.disc_type, self.method, self.level, self.chunk = struct.unpack(">IIiI", h2[:16])
+        self.dhead = h2[16:0x90]
+        if self.method > 5 or (self.rvz and self.method == 1):
+            raise UnpackError(f"unsupported compression method {self.method}")
+        npart, psize, poff = struct.unpack(">IIQ", h2[0x90:0xA0])
+        nraw, roff, rsize, ngrp, goff, gsize = struct.unpack(">IQIIQI", h2[0xB4:0xD4])
+        self.cdata = h2[0xD5:0xD5 + h2[0xD4]]
+        self.f.seek(poff)
+        pbytes = self.f.read(npart * psize)
+        if hashlib.sha1(pbytes).digest() != h2[0xA0:0xB4]:
+            raise UnpackError("the partition table is damaged")
+        self.parts = []
+        for i in range(npart):
+            e = pbytes[i * psize:i * psize + 0x30].ljust(0x30, b"\0")
+            pds = [struct.unpack(">4I", e[16 + 16 * j:32 + 16 * j]) for j in range(2)]
+            self.parts.append((e[:16], pds, AesCbc(e[:16])))
+        raw = self._decomp(self.method, self._pread(roff, rsize), nraw * 24)
+        self.raws = [struct.unpack(">QQII", raw[i * 24:i * 24 + 24]) for i in range(nraw)]
+        gs = 12 if self.rvz else 8
+        graw = self._decomp(self.method, self._pread(goff, gsize), ngrp * gs)
+        self.groups = [struct.unpack(">III" if self.rvz else ">II", graw[i * gs:(i + 1) * gs]) + ((0,) if not self.rvz else ())
+                       for i in range(ngrp)]
+        regions = []
+        for i, (o, s, gi, ng) in enumerate(self.raws):
+            if s:
+                regions.append((o, o + s, "r", i))
+        for i, (_, pds, _) in enumerate(self.parts):
+            end = pds[1][0] + pds[1][1] if pds[1][1] else pds[0][0] + pds[0][1]
+            if end > pds[0][0]:
+                regions.append((pds[0][0] * CL, end * CL, "p", i))
+        regions.sort()
+        self.regions = regions
+        self.starts = [r[0] for r in regions]
+        self.cache = {}
+
+    def _pread(self, pos, n):
+        self.f.seek(pos)
+        return self.f.read(n)
+
+    def _decomp(self, method, data, size=0):
+        if method == 0:
+            return data
+        if method == 1:
+            return _purge_decode(data, size)
+        if method == 2:
+            return bz2.decompress(data)
+        if method == 5:
+            try:
+                import zstandard
+            except ImportError:
+                raise UnpackError("this file uses zstd compression, which needs the 'zstandard' package") from None
+            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        cd = self.cdata
+        if method == 3:
+            if len(cd) != 5 or cd[0] >= 225:
+                raise UnpackError("unreadable LZMA settings")
+            d = cd[0]
+            filt = {"id": lzma.FILTER_LZMA1, "dict_size": struct.unpack("<I", cd[1:5])[0], "lc": d % 9, "lp": d // 9 % 5, "pb": d // 45}
+        else:
+            if len(cd) != 1 or cd[0] > 40:
+                raise UnpackError("unreadable LZMA2 settings")
+            p = cd[0]
+            filt = {"id": lzma.FILTER_LZMA2, "dict_size": 0xFFFFFFFF if p == 40 else (2 | (p & 1)) << (p // 2 + 11)}
+        return lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[filt]).decompress(data)
+
+    def _group(self, gi, size, nlists, data_off):
+        """One group's data (`size` bytes) and its lists of hash exceptions."""
+        key = (gi, size)
+        if key in self.cache:
+            return self.cache[key]
+        d4, ds, packed = self.groups[gi]
+        method = self.method
+        if self.rvz:
+            if not ds & 0x80000000:
+                method = 0
+            ds &= 0x7FFFFFFF
+        if ds == 0:
+            res = (bytes(size), [[] for _ in range(nlists)])
+        else:
+            raw = self._pread(d4 * 4, ds)
+            if method > 1:
+                raw = self._decomp(method, raw)
+            lists, pos = [], 0
+            for _ in range(nlists):
+                cnt = struct.unpack_from(">H", raw, pos)[0]
+                lists.append([(struct.unpack_from(">H", raw, pos + 2 + 22 * k)[0], raw[pos + 4 + 22 * k:pos + 24 + 22 * k]) for k in range(cnt)])
+                pos += 2 + 22 * cnt
+            if method <= 1 and nlists:
+                pos = (pos + 3) & ~3
+            body = raw[pos:]
+            if method == 1:
+                body = _purge_decode(body, packed or size)
+            if packed:
+                body = rvz_unpack(body, data_off)
+            if len(body) < size:
+                raise UnpackError("a block of the file is shorter than it should be")
+            res = (body[:size], lists)
+        if len(self.cache) > 3:
+            self.cache.pop(next(iter(self.cache)))
+        self.cache[key] = res
+        return res
+
+    def _raw_part(self, ri, off, n):
+        o, s, gi, ng = self.raws[ri]
+        base = o - o % CL
+        end = o + s
+        g = (off - base) // self.chunk
+        gstart = base + g * self.chunk
+        gsize = min(self.chunk, end - gstart)
+        body, _ = self._group(gi + g, gsize, 0, g * self.chunk)
+        a = off - gstart
+        return body[a:a + n]
+
+    def _wii_group(self, pi, g):
+        key, pds, aes = self.parts[pi]
+        p0 = pds[0][0]
+        total = (pds[1][0] + pds[1][1] - p0) if pds[1][1] else pds[0][1]
+        lo_c, hi_c = g * 64, min(g * 64 + 64, total)
+        data = bytearray(64 * CLD)
+        exc = []
+        cs = self.chunk // CL
+        for first, n, gidx, ngr in pds:
+            if not n:
+                continue
+            rel0 = first - p0
+            lo, hi = max(lo_c, rel0), min(hi_c, rel0 + n)
+            if lo >= hi:
+                continue
+            for ci in range((lo - rel0) // cs, (hi - 1 - rel0) // cs + 1):
+                cstart = rel0 + ci * cs
+                cn = min(cs, rel0 + n - cstart)
+                nl = max(1, cs // 64)
+                body, lists = self._group(gidx + ci, cn * CLD, nl, ci * cs * CLD)
+                a, b = max(lo, cstart), min(hi, cstart + cn)
+                data[(a - lo_c) * CLD:(b - lo_c) * CLD] = body[(a - cstart) * CLD:(b - cstart) * CLD]
+                if cs >= 64:
+                    lst, add = lists[(lo_c - cstart) // 64], 0
+                else:
+                    lst, add = lists[0], (cstart - lo_c) * 0x400
+                exc += [(o + add, h) for o, h in lst]
+        hb = wii_hash_group(data)
+        for o, h in exc:
+            if o // 0x400 < 64:
+                hb[o // 0x400][o % 0x400:o % 0x400 + 20] = h
+        out = []
+        for b in range(hi_c - lo_c):
+            eh = aes.crypt(hb[b])
+            out.append(eh + aes.crypt(bytes(data[b * CLD:(b + 1) * CLD]), eh[0x3D0:0x3E0]))
+        return b"".join(out)
+
+    def read(self, off, n):
+        out = []
+        end = min(off + n, self.size)
+        want = n
+        while off < end:
+            if off < 0x80:
+                take = min(0x80 - off, end - off)
+                out.append(self.dhead[off:off + take])
+                off += take
+                continue
+            ri = bisect.bisect_right(self.starts, off) - 1
+            if ri < 0 or off >= self.regions[ri][1]:
+                nxt = self.starts[ri + 1] if ri + 1 < len(self.starts) else end
+                take = min(nxt, end) - off
+                out.append(bytes(take))
+                off += take
+                continue
+            s, e, kind, idx = self.regions[ri]
+            if kind == "r":
+                piece = self._raw_part(idx, off, min(end, e) - off)
+            else:
+                g, inb = divmod(off - s, 64 * CL)
+                ck = ("w", idx, g)
+                if ck not in self.cache:
+                    if len(self.cache) > 3:
+                        self.cache.pop(next(iter(self.cache)))
+                    self.cache[ck] = self._wii_group(idx, g)
+                piece = self.cache[ck][inb:inb + min(end, e) - off]
+            out.append(piece)
+            off += len(piece)
+        return b"".join(out).ljust(want, b"\0")
+
+    def close(self):
+        self.f.close()
+
+
+def wii_hash_group(data):
+    """The 64 hash blocks (H0, H1, H2) of one Wii group of 64 x 0x7C00 bytes of data."""
+    sha1 = hashlib.sha1
+    hb = [bytearray(0x400) for _ in range(64)]
+    h0s = []
+    for b in range(64):
+        blk = data[b * CLD:(b + 1) * CLD]
+        h0 = b"".join([sha1(blk[j:j + 0x400]).digest() for j in range(0, CLD, 0x400)])
+        hb[b][0:620] = h0
+        h0s.append(sha1(h0).digest())
+    h2 = []
+    for s in range(8):
+        h1 = b"".join(h0s[s * 8:s * 8 + 8])
+        for b in range(s * 8, s * 8 + 8):
+            hb[b][0x280:0x320] = h1
+        h2.append(sha1(h1).digest())
+    h2 = b"".join(h2)
+    for b in range(64):
+        hb[b][0x340:0x3E0] = h2
+    return hb
+
+
+def open_disc(path):
+    """Open any GameCube/Wii disc container by what is inside it."""
+    with open(path, "rb") as f:
+        h = f.read(8)
+    if h[:4] == b"WBFS":
+        return WbfsDisc(path)
+    if h[:4] == b"WUX0":
+        return WuxDisc(path)
+    if h[:4] == b"CISO" and struct.unpack("<I", h[4:8])[0] != 24:
+        return CisoDisc(path)
+    if h[:4] == GCZ_MAGIC:
+        return GczDisc(path)
+    if h[:4] in (b"WIA\x01", b"RVZ\x01"):
+        return RvzDisc(path)
+    return IsoDisc(path)
+
+
+def disc_kind(path):
+    """'Wii' or 'GameCube' when the file is one of those discs in any of the supported containers, else ''."""
+    try:
+        d = open_disc(path)
+    except (OSError, UnpackError, struct.error, ValueError):
+        return ""
+    try:
+        return d.info()["platform"]
+    except (UnpackError, OSError, struct.error, ValueError, zlib.error):
+        return ""
+    finally:
+        d.close()
+
+
+def disc_to_iso(disc, dst, progress, stopped, step=1 << 22):
+    with open(dst, "wb") as g:
+        off = 0
+        while off < disc.size:
+            n = min(step, disc.size - off)
+            g.write(disc.read(off, n))
+            off += n
+            progress(off / disc.size)
+            if stopped():
+                raise UnpackError("stopped")
+
+
+# ---- writing the containers
+class KeyNeeded(UnpackError):
+    """A Wii conversion that can't go on without the user's own Wii key."""
+
+
+WII_KEYS = [None, None]                  # the Wii common key and the Korean one, only ever from the user's own files
+WII_TOOL = [""]                          # the user's DolphinTool.exe, when there is one
+WII_SCRUB = [True]
+KEYS_DIR = HERE / "keys"
+KEYS_README = """Put your own Wii keys in this folder. CHD Manager doesn't contain them and never downloads them.
+
+A file here can be called anything ending in .txt, .key, .bin or .hex. It holds the key as 32 hexadecimal
+characters (16 bytes), for example one line:
+
+    common: <32 hex characters>
+    korean: <32 hex characters>   (only for Korean discs)
+
+A line with no label is taken as the common key. A file of exactly 16 raw bytes also works (a name containing
+"korea" makes it the Korean key). You can instead paste the key into Settings, Formats.
+
+The key is only needed to write RVZ, WIA or WBFS from a Wii disc. Reading every format, and everything for GameCube and
+Wii U discs, works without it. If Dolphin is on this PC, its DolphinTool.exe can do the RVZ and WIA conversions instead.
+"""
+
+
+def parse_wii_keys(data, name=""):
+    """[common key or None, Korean key or None] found in the contents of one key file."""
+    out = [None, None]
+    if len(data) == 16:
+        out["korea" in name.lower()] = bytes(data)
+        return out
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = re.split(r"#|;|//", line)[0]
+        m = re.search(r"(?<![0-9a-fA-F])(?:0x)?([0-9a-fA-F]{32})(?![0-9a-fA-F])", line) or \
+            re.search(r"((?:[0-9a-fA-F]{2}[ :\-]){15}[0-9a-fA-F]{2})", line)
+        if m:
+            key = bytes.fromhex(re.sub(r"[^0-9a-fA-F]", "", m.group(1)))
+            out["korea" in line.lower() or " new" in line.lower()] = key
+    return out
+
+
+def load_wii_keys(pasted_common="", pasted_korean=""):
+    """Read the keys folder, then whatever was pasted into Settings; sets WII_KEYS."""
+    keys = [None, None]
+    try:
+        for f in sorted(KEYS_DIR.iterdir()):
+            if f.is_file() and f.suffix.lower() in (".txt", ".key", ".bin", ".hex") and f.name.lower() != "readme.txt" and f.stat().st_size < 4096:
+                for i, k in enumerate(parse_wii_keys(f.read_bytes(), f.name)):
+                    keys[i] = keys[i] or k
+    except OSError:
+        pass
+    for i, text in enumerate((pasted_common, pasted_korean)):
+        if not keys[i] and text:
+            keys[i] = parse_wii_keys(text.encode("ascii", "ignore"))[0]
+    WII_KEYS[:] = keys
+
+
+def ensure_keys_dir():
+    try:
+        KEYS_DIR.mkdir(exist_ok=True)
+        if not (KEYS_DIR / "README.txt").exists():
+            (KEYS_DIR / "README.txt").write_text(KEYS_README, "utf-8")
+    except OSError:
+        pass
+
+
+def find_dolphintool(configured=""):
+    """The user's DolphinTool.exe: the path set in Settings, next to this program, on the PATH, or in a folder named Dolphin*
+    directly inside the usual program folders. Nothing else is searched."""
+    cands = [Path(configured)] if configured else []
+    cands += [HERE / "DolphinTool.exe", HERE / "Dolphin" / "DolphinTool.exe", HERE / "Dolphin-x64" / "DolphinTool.exe"]
+    w = shutil.which("DolphinTool.exe")
+    if w:
+        cands.append(Path(w))
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(env)
+        base = Path(root) / ("Programs" if env == "LOCALAPPDATA" else "") if root else None
+        try:
+            if base and base.is_dir():
+                cands += [d / "DolphinTool.exe" for d in sorted(base.iterdir()) if d.name.lower().startswith("dolphin")]
+        except OSError:
+            pass
+    for c in cands:
+        try:
+            if c.is_file():
+                return str(c)
+        except OSError:
+            pass
+    return ""
+
+
+def wii_can(what):
+    """Whether a conversion that needs the Wii key can be done on this PC: 'rvz' (RVZ and WIA) or 'wbfs'."""
+    if WII_KEYS[0]:
+        return True
+    return bool(WII_TOOL[0]) if what == "rvz" else not WII_SCRUB[0]
+
+
+def wii_partitions(disc):
+    """[(partition offset, data offset, data size, title key)] of the Wii partitions this code can handle."""
+    out = []
+    try:
+        tbl = disc.read(0x40000, 0x20)
+        for g in range(4):
+            n, off = struct.unpack(">II", tbl[g * 8:g * 8 + 8])
+            if not n or n > 16:
+                continue
+            ents = disc.read(off << 2, n * 8)
+            for i in range(n):
+                poff = struct.unpack(">I", ents[i * 8:i * 8 + 4])[0] << 2
+                h = disc.read(poff, 0x2C0)
+                if struct.unpack(">I", h[:4])[0] != 0x10001 or h[0x1F1] > 1:
+                    continue
+                doff, dsize = (x << 2 for x in struct.unpack(">II", h[0x2B8:0x2C0]))
+                if (poff + doff) % CL or dsize < CL or poff + doff + dsize > disc.size + CL:
+                    continue
+                ckey = WII_KEYS[h[0x1F1]]
+                if not ckey:
+                    raise KeyNeeded("this Wii disc needs your Wii key: put it in the keys folder or paste it into Settings")
+                key = AesCbc(ckey).crypt(h[0x1BF:0x1CF], h[0x1DC:0x1E4] + bytes(8), decrypt=True)
+                first = disc.read(poff + doff, 0x420)
+                plain = AesCbc(key).crypt(first[0x400:0x420], first[0x3D0:0x3E0], decrypt=True)
+                if struct.unpack(">I", plain[0x18:0x1C])[0] != WII_MAGIC:
+                    raise KeyNeeded("the Wii key doesn't fit this disc (is it the right key?)")
+                out.append((poff, doff, min(dsize, disc.size - poff - doff), key))
+    except KeyNeeded:
+        raise
+    except (UnpackError, struct.error, ValueError):
+        return []
+    out.sort()
+    ok, last = [], 0
+    for p in out:
+        if p[0] >= last:
+            ok.append(p)
+            last = p[0] + p[1] + p[2]
+    return ok
+
+
+def wii_used_clusters(disc):
+    """One byte per 0x8000 of a Wii disc: 1 when something on the disc lives there (headers, system files, game files).
+    None when the disc can't be read that way."""
+    parts = wii_partitions(disc)
+    if not parts:
+        return None
+    used = bytearray((disc.size + CL - 1) // CL + 1)
+
+    def mark(a, b):
+        for s in range(a // CL, min((b - 1) // CL + 1, len(used))):
+            used[s] = 1
+    mark(0, 0x50000)
+    try:
+        for poff, doff, dsize, key in parts:
+            mark(poff, poff + doff)
+            aes = AesCbc(key)
+            start, nclu = poff + doff, dsize // CL
+
+            def pdata(off, n):
+                out = []
+                c = off // CLD
+                while c * CLD < off + n and c < nclu:
+                    raw = disc.read(start + c * CL, CL)
+                    out.append(aes.crypt(raw[0x400:], raw[0x3D0:0x3E0], decrypt=True))
+                    c += 1
+                return b"".join(out)[off - off // CLD * CLD:][:n]
+
+            def mark_data(a, b):
+                if b > a:
+                    mark(start + a // CLD * CL, start + ((b - 1) // CLD + 1) * CL)
+            boot = pdata(0, 0x440)
+            dol, fst, fsz = (x << 2 for x in struct.unpack(">III", boot[0x420:0x42C]))
+            ap = pdata(0x2440, 0x20)
+            ap_end = 0x2460 + struct.unpack(">II", ap[0x14:0x1C])[0] + struct.unpack(">II", ap[0x14:0x1C])[1] if len(ap) >= 0x1C else 0x2440
+            dol_end = dol
+            if dol:
+                hd = pdata(dol, 0x100)
+                if len(hd) == 0x100:
+                    offs, sizes = struct.unpack(">18I", hd[:72]), struct.unpack(">18I", hd[0x90:0xD8])
+                    dol_end = dol + max([o + s for o, s in zip(offs, sizes)] + [0x100])
+            mark_data(0, max(fst + fsz, dol_end, ap_end))
+            f = pdata(fst, fsz)
+            n = struct.unpack(">I", f[8:12])[0] if len(f) >= 12 else 0
+            for i in range(1, n):
+                flags, off, ln = struct.unpack(">BxxxII", f[i * 12:i * 12 + 12])
+                if not flags:
+                    mark_data(off << 2, (off << 2) + ln)
+    except KeyNeeded:
+        raise
+    except (UnpackError, struct.error, ValueError):
+        return None
+    return used
+
+
+def write_wbfs(disc, dst, progress, stopped, scrub=True):
+    """A Wii disc -> WBFS: the disc is cut into 2 MiB blocks and blocks nothing uses are left out (scrubbing)."""
+    info = disc.info()
+    if info["platform"] != "Wii":
+        raise UnpackError("WBFS can only hold Wii discs")
+    wb, hd = 1 << 21, 512
+    per_disc = (143432 * 2 * CL + wb - 1) // wb
+    used = wii_used_clusters(disc) if scrub else None
+    nblocks = (disc.size + wb - 1) // wb
+    keep = []
+    for b in range(nblocks):
+        if used is not None:
+            if any(used[b * 64:b * 64 + 64]):
+                keep.append(b)
+        elif disc.read(b * wb, wb).strip(b"\0"):
+            keep.append(b)
+        if b % 64 == 0:
+            progress(0.1 * b / nblocks)
+            if stopped():
+                raise UnpackError("stopped")
+    if not keep:
+        raise UnpackError("this disc has no data in it")
+    total_secs = len(keep) + 1
+    wlba = [0] * per_disc
+    for i, b in enumerate(keep):
+        wlba[b] = i + 1
+    head = bytearray(hd)
+    head[0:4] = b"WBFS"
+    struct.pack_into(">IBB", head, 4, total_secs * wb // hd, 9, 21)
+    head[12] = 1
+    with open(dst, "wb") as g:
+        g.write(bytes(head))
+        g.write(disc.read(0, 256))
+        g.write(struct.pack(">%dH" % per_disc, *wlba))
+        g.write(bytes(wb - g.tell()))
+        for i, b in enumerate(keep):
+            g.write(disc.read(b * wb, wb).ljust(wb, b"\0"))
+            if i % 8 == 0:
+                progress(0.1 + 0.9 * i / len(keep))
+                if stopped():
+                    raise UnpackError("stopped")
+    progress(1.0)
+
+
+def write_ciso(disc, dst, progress, stopped, block=1 << 21):
+    """A disc -> CISO (Dolphin's layout: a 0x8000-byte header with a map of the blocks that are present, then those blocks)."""
+    n = (disc.size + block - 1) // block
+    if n > 0x7FF8:
+        raise UnpackError("this disc is too big for a CISO with 2 MiB blocks")
+    present = bytearray(0x7FF8)
+    with open(dst, "wb") as g:
+        g.write(bytes(0x8000))
+        for b in range(n):
+            data = disc.read(b * block, block)
+            if data.strip(b"\0") or b == n - 1:         # the last block is always kept, so the size survives
+                present[b] = 1
+                g.write(data)
+            if b % 16 == 0:
+                progress(b / n)
+                if stopped():
+                    raise UnpackError("stopped")
+        g.seek(0)
+        g.write(b"CISO" + struct.pack("<I", block) + bytes(present))
+    progress(1.0)
+
+
+def write_gcz(disc, dst, progress, stopped, block=None, level=9):
+    """A disc -> GCZ (deflate-compressed blocks with a table of offsets and checksums)."""
+    info = disc.info()
+    block = block or (0x4000 if info["platform"] != "Wii" else 0x20000)
+    n = (disc.size + block - 1) // block
+    offsets, hashes = [], []
+    with open(dst, "wb") as g:
+        g.write(bytes(32 + 12 * n))
+        pos = 0
+        for i in range(n):
+            data = disc.read(i * block, block).ljust(block, b"\0")
+            c = zlib.compressobj(level)
+            comp = c.compress(data) + c.flush()
+            if len(comp) > block - 10:
+                offsets.append(pos | 1 << 63)
+                comp = data
+            else:
+                offsets.append(pos)
+            hashes.append(zlib.adler32(comp))
+            g.write(comp)
+            pos += len(comp)
+            if i % 256 == 0:
+                progress(i / n)
+                if stopped():
+                    raise UnpackError("stopped")
+        g.seek(0)
+        g.write(GCZ_MAGIC + struct.pack("<IQQII", 1 if info["platform"] == "Wii" else 0, pos, disc.size, block, n))
+        g.write(struct.pack("<%dQ" % n, *offsets) + struct.pack("<%dI" % n, *hashes))
+    progress(1.0)
+
+
+def rvz_pack(buf, bytes_per_chunk, nchunks, data_offset):
+    """Find the pseudo-random junk in buf and write each chunk the way RVZ stores it: [(main data, packed size)]."""
+    total = len(buf)
+    junk = []                                              # (end, start, seed), in order
+    nz = re.compile(rb"[^\x00]")
+    pos, off = 0, data_offset
+    while pos < total:
+        m = nz.search(buf, pos)
+        z = (m.start() if m else total) - pos
+        pos += z
+        off += z
+        if pos >= total:
+            break
+        to_read = min(CL - off % CL, total - pos)
+        dm = off % CL
+        skip = -dm % 4
+        seg = buf[pos + skip:pos + to_read]
+        if len(seg) >= 2084:
+            seed = lfg_find_seed(seg, (dm + skip) // 4)
+            if seed:
+                n = common_prefix(Lfg(seed, dm).get(to_read), buf[pos:pos + to_read])
+                if n > 0:
+                    junk.append((pos + n, pos, seed))
+        pos += to_read
+        off += to_read
+    out = []
+    ends = [j[0] for j in junk]
+    for i in range(nchunks):
+        cur = i * bytes_per_chunk
+        end = min(cur + bytes_per_chunk, total)
+        main, packed, first = bytearray(), 0, True
+        while cur < end:
+            js = je = end
+            seed = None
+            if end - cur > 68:
+                k = bisect.bisect_right(ends, cur + 68)
+                if k < len(junk) and junk[k][1] + 68 < end:
+                    js, je, seed = max(cur, junk[k][1]), min(end, junk[k][0]), junk[k][2]
+            if first:
+                if js == end:
+                    main += buf[cur:end]
+                    break
+                first = False
+            if js > cur:
+                main += struct.pack(">I", js - cur) + buf[cur:js]
+                packed += 4 + js - cur
+                cur = js
+            if je > cur:
+                main += struct.pack(">I", (je - cur) | 0x80000000) + seed
+                packed += 4 + 68
+                cur = je
+        out.append((bytes(main), packed))
+    return out
+
+
+class _Compressor:
+    def __init__(self, method, level, chunk):
+        self.method = method
+        self.level = level = max(1, min(9, level)) if method in (2, 3, 4) else level
+        dict_size = max(1 << 16, 1 << (max(chunk, 1) - 1).bit_length())
+        self.cdata = b""
+        if method == 3:
+            self.filt = {"id": lzma.FILTER_LZMA1, "preset": level, "dict_size": dict_size, "lc": 3, "lp": 0, "pb": 2}
+            self.cdata = bytes([93]) + struct.pack("<I", dict_size)
+        elif method == 4:
+            p = 0
+            while ((2 | (p & 1)) << (p // 2 + 11)) < dict_size:
+                p += 1
+            self.filt = {"id": lzma.FILTER_LZMA2, "preset": level, "dict_size": (2 | (p & 1)) << (p // 2 + 11)}
+            self.cdata = bytes([p])
+        elif method == 5:
+            try:
+                import zstandard
+            except ImportError:
+                raise UnpackError("zstd compression needs the 'zstandard' package") from None
+            self.zc = zstandard.ZstdCompressor(level=level)
+
+    def __call__(self, data):
+        if self.method == 0:
+            return data
+        if self.method == 2:
+            return bz2.compress(data, self.level)
+        if self.method == 5:
+            return self.zc.compress(data)
+        return lzma.compress(data, lzma.FORMAT_RAW, filters=[self.filt])
+
+
+def write_rvz(disc, dst, progress, stopped, rvz=True, method=5, level=5, chunk=0x20000):
+    """A GameCube/Wii disc -> RVZ (or WIA). Wii partitions are stored decrypted and without their hashes; the pseudo-random
+    padding is stored as a seed (RVZ only); every chunk is compressed on its own."""
+    info = disc.info()
+    if info["platform"] not in ("Wii", "GameCube"):
+        raise UnpackError("this isn't a GameCube or Wii disc")
+    if rvz:
+        if chunk < CL or chunk > 0x200000 or chunk & (chunk - 1):
+            raise UnpackError("RVZ chunk size must be a power of two from 32 KiB to 2 MiB")
+    else:
+        chunk = 0x200000
+        method = 4 if method not in (0, 2, 3, 4) else method
+    if method > (5 if rvz else 4) or (rvz and method == 1):
+        raise UnpackError("unsupported compression method")
+    comp = _Compressor(method, level, chunk)
+    size = disc.size
+    parts = wii_partitions(disc) if info["platform"] == "Wii" else []
+    # ---- layout: raw regions and partition regions in disc order, each with its range of groups
+    raws, pents, todo, groups = [], [], [], 0
+
+    def add_raw(offset, n):
+        nonlocal groups
+        skip = min(0x80 - offset, n) if offset < 0x80 else 0
+        offset, n = offset + skip, n - skip
+        if n <= 0:
+            return
+        ng = -(-(n + offset % CL) // chunk)
+        raws.append((offset, n, groups, ng))
+        todo.append(("r", len(raws) - 1))
+        groups += ng
+    last = 0
+    for poff, doff, dsize, key in parts:
+        add_raw(last, poff - last)
+        add_raw(poff, doff)
+        fl = dsize // CL * CL
+        ng = -(-fl // chunk)
+        first = (poff + doff) // CL
+        pents.append((key, [(first, fl // CL, groups, ng), (first + fl // CL, 0, groups + ng, 0)]))
+        todo.append(("p", len(pents) - 1))
+        groups += ng
+        last = poff + doff + fl
+    add_raw(last, size - last)
+    entries = [None] * groups                                # (offset/4, size field, packed size)
+    cs = chunk // CL
+
+    def finish(gi, exc, main, packed, zero):
+        nonlocal pos
+        if zero and not any(exc):
+            entries[gi] = (0, 0, 0)                           # all zeroes, no exceptions: a size of 0 says so
+            return
+        lists = b"".join(struct.pack(">H", len(x)) + b"".join(struct.pack(">H", o) + h for o, h in x) for x in exc)
+        flag, payload = 0, None
+        if method:
+            cdat = comp(lists + main)
+            if not rvz:
+                payload = cdat
+            elif len(cdat) < len(main) + len(lists) + -len(lists) % 4:
+                payload, flag = cdat, 0x80000000
+        if payload is None:                                   # not compressed: lists padded to 4 bytes, then the data
+            payload = lists + bytes(-len(lists) % 4) + main
+        entries[gi] = (pos // 4, len(payload) | flag, packed)
+        g.write(payload)
+        pos += len(payload)
+        pad = -pos % 4
+        if pad:
+            g.write(bytes(pad))
+            pos += pad
+    with open(dst, "wb") as g:
+        g.write(bytes(0x48 + 0xDC))
+        pos = 0x48 + 0xDC
+        done = 0
+        for kind, idx in todo:
+            if kind == "r":
+                off, n, gi, ng = raws[idx]
+                base = off - off % CL
+                end = off + n
+                for k in range(ng):
+                    a = base + k * chunk
+                    data = disc.read(a, min(chunk, end - a))
+                    if rvz:
+                        main, packed = rvz_pack(data, len(data), 1, a)[0]
+                    else:
+                        main, packed = data, 0
+                    finish(gi + k, [], main, packed, not data.strip(b"\0"))
+                    done += len(data)
+                    progress(done / size)
+                    if stopped():
+                        raise UnpackError("stopped")
+            else:
+                key, pds = pents[idx]
+                first, nclu, gi, ng = pds[0]
+                aes = AesCbc(key)
+                start = first * CL
+                ngroups64 = -(-nclu // 64)
+                for g64 in range(ngroups64):
+                    nb = min(64, nclu - g64 * 64)
+                    raw = disc.read(start + g64 * 64 * CL, nb * CL)
+                    data = bytearray(64 * CLD)
+                    actual = []
+                    for b in range(nb):
+                        c = raw[b * CL:(b + 1) * CL]
+                        actual.append(aes.crypt(c[:0x400], bytes(16), decrypt=True))
+                        data[b * CLD:(b + 1) * CLD] = aes.crypt(c[0x400:], c[0x3D0:0x3E0], decrypt=True)
+                    hb = wii_hash_group(data)
+                    bpc = min(64, cs)
+                    nch = -(-nb // bpc)
+                    exc = [[] for _ in range(nch)]
+                    for b in range(nb):
+                        ch, bi = divmod(b, bpc)
+                        want, got = actual[b], bytes(hb[b])
+                        if want == got:
+                            continue
+                        for fo, fs in ((0, 620), (620, 20), (0x280, 160), (0x320, 32), (0x340, 160), (0x3E0, 32)):
+                            for l in range(0, fs, 20):
+                                o = fo + min(l, fs - 20)
+                                if want[o:o + 20] != got[o:o + 20]:
+                                    exc[ch].append((bi * 0x400 + o, want[o:o + 20]))
+                    body = bytes(data[:nb * CLD])
+                    if rvz:
+                        packs = rvz_pack(body, bpc * CLD, nch, g64 * 64 * CLD)
+                    else:
+                        packs = [(body[c * bpc * CLD:(c + 1) * bpc * CLD], 0) for c in range(nch)]
+                    for c in range(nch):
+                        main, packed = packs[c]
+                        zero = not body[c * bpc * CLD:(c + 1) * bpc * CLD].strip(b"\0")
+                        finish(gi + g64 * (64 // bpc) + c, [exc[c]], main, packed, zero)
+                    done += nb * CL
+                    progress(done / size)
+                    if stopped():
+                        raise UnpackError("stopped")
+        # ---- the tables and headers
+        praw = b"".join(struct.pack(">16s", k) + b"".join(struct.pack(">4I", *p) for p in pd) for k, pd in pents)
+        rawt = b"".join(struct.pack(">QQII", *r) for r in raws)
+        grpt = b"".join(struct.pack(">III" if rvz else ">II", *(e if rvz else e[:2])) for e in entries)
+        crawt, cgrpt = comp(rawt), comp(grpt)
+        poff = pos
+        g.write(praw)
+        roff = poff + len(praw)
+        g.write(crawt)
+        goff = roff + len(crawt)
+        g.write(cgrpt)
+        fsize = goff + len(cgrpt)
+        h2 = struct.pack(">IIiI", 2 if info["platform"] == "Wii" else 1, method, level, chunk) + disc.read(0, 0x80)
+        h2 += struct.pack(">IIQ", len(pents), 0x30, poff) + hashlib.sha1(praw).digest()
+        h2 += struct.pack(">IQIIQI", len(raws), roff, len(crawt), len(entries), goff, len(cgrpt))
+        h2 += bytes([len(comp.cdata)]) + comp.cdata.ljust(7, b"\0")
+        h1 = (b"RVZ\x01" if rvz else b"WIA\x01") + struct.pack(">II", 0x01000000, 0x00030000 if rvz else 0x01000000)
+        h1 += struct.pack(">I", len(h2)) + hashlib.sha1(h2).digest() + struct.pack(">QQ", size, fsize)
+        h1 += hashlib.sha1(h1).digest()
+        g.seek(0)
+        g.write(h1 + h2)
+    progress(1.0)
+
+
+def ecm_probe(path):
+    """The track type in the first sector of an ECM file ('MODE1/2352', 'MODE2/2352', 'MODE2/2336' or '')."""
+    with open(path, "rb") as f:
+        if f.read(4) != b"ECM\x00":
+            raise UnpackError("this is not an ECM file")
+        c = f.read(1)
+        if not c:
+            return ""
+        c = c[0]
+        typ, num, bits = c & 3, (c >> 2) & 0x1F, 5
+        while c & 0x80:
+            c = f.read(1)[0]
+            num |= (c & 0x7F) << bits
+            bits += 7
+        if typ == 1:
+            return "MODE1/2352"
+        if typ in (2, 3):
+            return "MODE2/2336"
+        lit = f.read(min(num + 1, 16))
+        if len(lit) >= 16 and lit[:12] == _SYNC and lit[15] in (1, 2):
+            return f"MODE{lit[15]}/2352"
+    return ""
+
+
+def verify_disc_file(path, src, kind, progress, stopped):
+    """True when the container at `path` holds the disc `src`. A WBFS is checked on the blocks it stores and a CISO up to
+    the size of the disc, since those formats leave out (or pad) data that nothing uses."""
+    d = open_disc(path)
+    try:
+        if kind == "wbfs":
+            for i, v in enumerate(d.wlba):
+                if v and d.read(i * d.wb, d.wb) != src.read(i * d.wb, d.wb):
+                    return False
+                if i % 16 == 0:
+                    progress(i / len(d.wlba))
+                    if stopped():
+                        raise UnpackError("stopped")
+            return True
+        if kind == "ciso":
+            off = 0
+            while off < src.size:
+                n = min(1 << 22, src.size - off)
+                if d.read(off, n) != src.read(off, n):
+                    return False
+                off += n
+                progress(off / src.size)
+                if stopped():
+                    raise UnpackError("stopped")
+            return True
+        return discs_equal(d, src, progress, stopped)
+    finally:
+        d.close()
+
+
+def discs_equal(a, b, progress=lambda x: None, stopped=lambda: False, step=1 << 22):
+    """True when two disc images hold exactly the same bytes."""
+    if a.size != b.size:
+        return False
+    off = 0
+    while off < a.size:
+        n = min(step, a.size - off)
+        if a.read(off, n) != b.read(off, n):
+            return False
+        off += n
+        progress(off / a.size)
+        if stopped():
+            raise UnpackError("stopped")
+    return True
 
 
 # ------------------------------------------------------ CHD -> PBP (PlayStation 1), written from the layout notes above
@@ -1986,20 +3564,28 @@ def verify_cdi(out_path, cue, progress, stopped):
 
 # ------------------------------------------------------------------ CSO (compressed ISO, used for PSP games)
 def read_cso_header(path):
-    """-> (size of the ISO in bytes, block size, offset shift)"""
+    """-> (size of the ISO in bytes, block size, offset shift). Works for CSO (deflate) and ZSO (LZ4)."""
     with open(path, "rb") as f:
         h = f.read(24)
-    if len(h) < 24 or h[:4] != b"CISO":
-        raise UnpackError("this is not a CSO file (a ZSO or a damaged file?)")
-    _, total, block, ver, shift = struct.unpack("<IQIBB2x", h[4:])
+    if len(h) < 24 or h[:4] not in (b"CISO", b"ZISO"):
+        raise UnpackError("this is not a CSO or ZSO file")
+    hsize, total, block, ver, shift = struct.unpack("<IQIBB2x", h[4:])
+    if h[:4] == b"CISO" and hsize != 24:
+        raise UnpackError("this is a GameCube/Wii CISO, not a PSP CSO")
     if ver > 1 or block < 512 or block & (block - 1) or shift > 8 or not total:
         raise UnpackError("this CSO uses a version or layout CHD Manager can't read")
     return total, block, shift
 
 
+def cso_is_zso(path):
+    with open(path, "rb") as f:
+        return f.read(4) == b"ZISO"
+
+
 def iter_cso(path):
-    """Yield (block count, the ISO bytes of each block) of a CSO, in order."""
+    """Yield (block count, the ISO bytes of each block) of a CSO or ZSO, in order."""
     total, block, shift = read_cso_header(path)
+    lz = cso_is_zso(path)
     n = (total + block - 1) // block
     with open(path, "rb") as f:
         f.seek(24)
@@ -2012,11 +3598,16 @@ def iter_cso(path):
             raw = f.read(end - start)
             need = min(block, total - i * block)
             try:
-                data = raw[:block] if a & 0x80000000 else zlib.decompressobj(-15).decompress(raw)
+                if a & 0x80000000:
+                    data = raw[:block]
+                elif lz:
+                    data = lz4_decompress(raw, block)
+                else:
+                    data = zlib.decompressobj(-15).decompress(raw)
             except zlib.error:
                 data = b""
             if len(data) < need:
-                raise UnpackError(f"the CSO is damaged (block {i})")
+                raise UnpackError(f"the {'ZSO' if lz else 'CSO'} is damaged (block {i})")
             yield n, data[:need]
 
 
@@ -2033,18 +3624,20 @@ def cso_to_iso(src, dst, progress, stopped):
     progress(1.0)
 
 
-def iso_to_cso(src, dst, progress, stopped, level=9):
-    """ISO -> CSO version 1: 2048-byte blocks, each raw-deflated (or stored when that doesn't shrink it)."""
+def iso_to_cso(src, dst, progress, stopped, level=9, lz4=False):
+    """ISO -> CSO version 1 (blocks raw-deflated) or, with lz4, ZSO (blocks LZ4-compressed): 2048-byte blocks,
+    stored as they are when compressing doesn't shrink them."""
     total, block = os.path.getsize(src), 2048
     n = (total + block - 1) // block
     shift = 0
-    while 24 + 4 * (n + 1) + total + n * ((1 << shift) - 1) >= 1 << (31 + shift):   # offsets must fit in 31 bits
+    # offsets must fit in 31 bits; an LZ4 block can't be padded safely, so a ZSO is aligned only when it has to be
+    while 24 + 4 * (n + 1) + total + n * ((1 << shift) - 1) >= 1 << (31 + shift):
         shift += 1
     align = 1 << shift
     index = [0] * (n + 1)
     pos = 24 + 4 * (n + 1)
     with open(src, "rb") as f, open(dst, "wb") as g:
-        g.write(struct.pack("<4sIQIBB2x", b"CISO", 24, total, block, 1, shift) + b"\0" * (4 * (n + 1)))
+        g.write(struct.pack("<4sIQIBB2x", b"ZISO" if lz4 else b"CISO", 24, total, block, 1, shift) + b"\0" * (4 * (n + 1)))
         for i in range(n + 1):
             pad = -pos % align
             if pad:
@@ -2054,8 +3647,11 @@ def iso_to_cso(src, dst, progress, stopped, level=9):
                 index[i] = pos >> shift
                 break
             data = f.read(block).ljust(block, b"\0")
-            c = zlib.compressobj(level, zlib.DEFLATED, -15)
-            comp = c.compress(data) + c.flush()
+            if lz4:
+                comp = lz4_compress(data)
+            else:
+                c = zlib.compressobj(level, zlib.DEFLATED, -15)
+                comp = c.compress(data) + c.flush()
             if len(comp) >= block:
                 index[i] = (pos >> shift) | 0x80000000
                 g.write(data)
@@ -2189,10 +3785,13 @@ TARGET_LABELS = {"chd": "→ CHD", "cue": "→ CUE/BIN", "cue_split": "→ CUE/B
                  "cue_single": "→ CUE/BIN, one single BIN", "iso": "→ ISO", "gdi": "→ GDI",
                  "pbp": "→ PlayStation PBP", "cdi": "→ DiscJuggler CDI (experimental)", "cso": "→ CSO (compressed ISO)",
                  "verify": "Verify only", "recompress": "Recompress", "auto": "Extract", "art": "→ Artwork images (PNG)",
-                 "cue_fix": "→ CUE/BIN, error correction rebuilt"}
+                 "cue_fix": "→ CUE/BIN, error correction rebuilt", "zso": "→ ZSO (LZ4 compressed ISO)",
+                 "ecm": "→ ECM (error codes removed)", "wbfs": "→ WBFS", "ciso": "→ CISO", "gcz": "→ GCZ",
+                 "rvz": "→ RVZ (Dolphin, compressed)", "wia": "→ WIA", "wud": "→ WUD (raw Wii U disc)",
+                 "wux": "→ WUX (compressed Wii U disc)"}
 # how the CHD extraction code names each target
 TARGET_FMT = {"cue": "auto", "cue_split": "split", "cue_single": "single", "iso": "iso", "gdi": "auto", "pbp": "pbp",
-              "cdi": "cdi", "cso": "cso", "auto": "auto", "cue_fix": "fix"}
+              "cdi": "cdi", "cso": "cso", "auto": "auto", "cue_fix": "fix", "zso": "zso", "ecm": "ecm"}
 CUE_TYPE = {"AUDIO": "AUDIO", "MODE1/2048": "MODE1", "MODE1/2352": "MODE1_RAW", "MODE2/2352": "MODE2_RAW"}
 
 
@@ -2246,6 +3845,7 @@ class Job:
         self.game_id, self.name_warned, self.disc_pick = "", False, None
         self.archive, self.extract_dir = None, None   # set when the file was unpacked from an archive
         self.wrap_cue = None           # a raw image without a CUE: the track type found in its first sector ('MODE2/2352')
+        self.disc_info = {}            # GameCube/Wii discs: id, title and the container format
         self.status = "Queued"
         self.result = ""
         self.out_path = None
@@ -2269,6 +3869,16 @@ class Job:
 
     def available_targets(self):
         """[(key, label)] of everything this item can safely become. Nothing is offered that is known not to work."""
+        if self.container == "disc":                # GameCube / Wii: Dolphin's formats (a CHD of these runs nowhere)
+            own = self.disc_info.get("format", "ISO").lower()
+            if self.platform == "Wii U":
+                return [(k, target_label(k)) for k in ("wux", "wud") if k != own]
+            keys = [k for k in ["rvz", "iso", "gcz", "wia", "ciso"] + (["wbfs"] if self.platform == "Wii" else []) if k != own]
+            if own != "iso":
+                keys.insert(0, keys.pop(keys.index("iso")))
+            if self.platform == "Wii":                  # RVZ, WIA and WBFS from a Wii disc need the user's key (or their Dolphin)
+                keys = [k for k in keys if not (k in ("rvz", "wia") and not wii_can("rvz")) and not (k == "wbfs" and not wii_can("wbfs"))]
+            return [(k, target_label(k)) for k in keys]
         ext, ty = self.path.suffix.lower(), self.types
         data = [x for x in ty if x != "AUDIO"]
         single = len(ty) == 1 and ty[0].startswith("MODE")
@@ -2278,17 +3888,19 @@ class Job:
             if self.disc == "CD":
                 keys += ["cue"] if len(ty) <= 1 else ["cue_split", "cue_single"]
                 if single:
-                    keys += ["iso", "cso"]
+                    keys += ["iso", "cso", "zso"]
                 if raw and data[0].startswith("MODE2"):
                     keys.append("pbp")
                 if raw:
                     keys.append("cdi")
-                if raw and data[0].startswith("MODE2"):
+                if raw:
                     keys.append("cue_fix")
+                if raw and len(ty) == 1:
+                    keys.append("ecm")
             elif self.disc == "GD-ROM":
                 keys.append("gdi")
             elif self.disc == "DVD":
-                keys += ["iso", "cso"]
+                keys += ["iso", "cso", "zso"]
             else:
                 keys.append("auto")
             keys.append("verify")
@@ -2298,20 +3910,21 @@ class Job:
             keys.append("pbp")
         else:
             keys.append("chd")
-            if ty and self.container in ("pbp", "cdi", "image"):
+            if ty and self.container in ("pbp", "cdi", "image", "ecm"):
                 keys.append("cue")
             if self.container == "pbp":
                 keys.append("art")
             if ty and self.disc_count == 1:
                 if single:
-                    keys += [k for k, skip in (("iso", ".iso"), ("cso", ".cso")) if ext != skip or self.wrap_cue]
+                    keys += [k for k, skip in (("iso", ".iso"), ("cso", ".cso"), ("zso", ".zso")) if ext != skip or self.wrap_cue]
                 if raw and self.container != "cso":
                     if self.platform == "PS1" and ext != ".pbp":
                         keys.append("pbp")
                     if ext != ".cdi":
                         keys.append("cdi")
-                    if data[0].startswith("MODE2"):
-                        keys.append("cue_fix")
+                    keys.append("cue_fix")
+                    if len(ty) == 1 and ext != ".ecm":
+                        keys.append("ecm")
                 elif ext in (".iso", ".cso") and self.platform == "PS1":
                     keys.append("pbp")            # a plain PS1 ISO: raw sectors are rebuilt for the PBP
         if self.container == "pbp" and self.disc_count > 1:
@@ -2331,6 +3944,8 @@ class Job:
     def guess_game_id(self):
         """The PlayStation game code ('SLUS01545') when it can be read straight from the file, else ''."""
         ext = self.path.suffix.lower()
+        if self.container == "disc":
+            return self.disc_info.get("id", "")
         try:
             if ext == ".pbp":
                 return pbp_game_id(self.path)
@@ -2358,7 +3973,27 @@ class Job:
             self.tracks = len(self.types)
             self.src_files = [p]
             return
-        if ext == ".cso":
+        kind = disc_kind(p) if ext in (".iso", ".gcm", ".gcz", ".rvz", ".wia", ".wbfs", ".ciso", ".wux", ".wud") else ""
+        if kind:
+            d = open_disc(p)
+            try:
+                self.disc_info = dict(d.info(), format="WUD" if kind == "Wii U" and d.kind == "ISO" else d.kind)
+                self.src_files = [Path(f.name) for f in getattr(d, "files", [])] or [p]
+            finally:
+                d.close()
+            self.container, self.platform, self.disc = "disc", kind, f"{kind} disc"
+            self.size = sum(f.stat().st_size for f in self.src_files)
+            self.auto_type, self.reason = "DVD", f"{kind} disc image"
+            return
+        if ext in (".gcm", ".gcz", ".rvz", ".wia", ".wbfs", ".wux", ".wud"):
+            raise ValueError("this doesn't look like a readable GameCube/Wii/Wii U disc image (damaged, or not a disc)")
+        if ext == ".ecm":
+            t = ecm_probe(p)
+            self.container, self.size, self.src_files = "ecm", p.stat().st_size, [p]
+            self.types = [CUE_TYPE[t]] if t in CUE_TYPE else []
+            self.auto_type, self.reason = "CD", f"ECM file ({t or 'sector type unknown'})"
+            return
+        if ext in (".cso", ".zso", ".ciso"):
             total = read_cso_header(p)[0]
             self.size, self.src_files, self.container, self.types = p.stat().st_size, [p], "cso", ["MODE1"]
             self.platform = cso_platform(p)
@@ -2456,7 +4091,7 @@ DEFAULTS = {
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
     "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
-    "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "art_dir": "", "title_cards": True, "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
+    "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "rvz_method": "zstd", "rvz_level": 5, "rvz_chunk": 131072, "wbfs_scrub": True, "dolphintool": "", "wii_common_key": "", "wii_korean_key": "", "wii_warn_off": False, "art_dir": "", "title_cards": True, "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
 
 
@@ -2498,6 +4133,8 @@ class App:
             self.log("chdman.exe not found. Put it next to this script or set it in Settings, Output page.", "err")
         self.latest = None
         self.refresh_suggestions()
+        ensure_keys_dir()
+        self.refresh_wii()
         if initial_paths:
             self.root.after(400, lambda: self.add_paths([str(x) for x in initial_paths]))
         self.root.after(80, self.pump)
@@ -2506,6 +4143,8 @@ class App:
             self.root.after(1500, lambda: self.check_update_async(manual=False))
         if self.v["auto_app_check"].get() and not silent:
             self.root.after(2500, lambda: self.check_app_update_async(manual=False))
+        if not silent:
+            self.root.after(1200, self.wii_warning)
 
     # ------------------------------------------------------------------ UI
     def build_ui(self):
@@ -2682,6 +4321,8 @@ class App:
         for key in ("compression", "custom_comp", "hunk", "threads", "verify_after", "low_priority", "delete_src",
                     "exists", "out_mode", "out_dir", "auto_suggest"):
             self.v[key].trace_add("write", lambda *a: self.refresh_summary())
+        for key in ("dolphintool", "wii_common_key", "wii_korean_key", "wbfs_scrub"):
+            self.v[key].trace_add("write", lambda *a: self.refresh_wii())
         self.style_widgets()
         self.refresh_summary()
         self.refresh_chd_controls()
@@ -2782,6 +4423,28 @@ class App:
         tf.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Checkbutton(tf, text="Draw a title card (game name and code) for PBPs that have no artwork of your own",
                         variable=v["title_cards"]).grid(row=0, column=0, sticky="w")
+        kf = ttk.Frame(f)
+        kf.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(kf, text="Wii conversions need your Wii key, or Dolphin's DolphinTool.exe (optional path):").grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Entry(kf, textvariable=v["dolphintool"], width=44).grid(row=1, column=0)
+        ttk.Button(kf, text="Browse…", command=self.pick_dolphintool).grid(row=1, column=1, padx=4)
+        ttk.Button(kf, text="Wii key…", command=self.show_keys_dialog).grid(row=1, column=2)
+        self.wii_status = ttk.Label(kf, text="", style="Muted.TLabel")
+        self.wii_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ttk.Button(kf, text="Open the keys folder", command=self.open_keys_folder).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        df = ttk.Frame(f)
+        df.grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(df, text="Wii / GameCube RVZ and WIA:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(df, textvariable=v["rvz_method"], width=7, state="readonly",
+                     values=["zstd", "lzma", "lzma2", "bzip2", "none"]).grid(row=0, column=1, padx=(8, 4))
+        ttk.Label(df, text="level").grid(row=0, column=2)
+        ttk.Combobox(df, textvariable=v["rvz_level"], width=4, state="readonly", values=list(range(1, 10))).grid(row=0, column=3, padx=4)
+        ttk.Label(df, text="block").grid(row=0, column=4)
+        ttk.Combobox(df, textvariable=v["rvz_chunk"], width=8, state="readonly",
+                     values=[32768, 65536, 131072, 262144, 524288, 1048576, 2097152]).grid(row=0, column=5, padx=4)
+        ttk.Checkbutton(df, text="WBFS: leave out data nothing uses (scrub)", variable=v["wbfs_scrub"]).grid(
+            row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
         pf = ttk.Frame(f)
         pf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Label(pf, text="PBP compression (0 = none, 9 = smallest):").grid(row=0, column=0, sticky="w")
@@ -3157,7 +4820,8 @@ class App:
         self.update_status_idle()
 
     GENERIC_TARGETS = (("chd", "→ CHD"), ("cue", "→ CUE/BIN"), ("iso", "→ ISO"), ("pbp", "→ PlayStation PBP"),
-                       ("cdi", "→ DiscJuggler CDI"), ("cso", "→ CSO"), ("verify", "Verify (CHD files)"),
+                       ("cdi", "→ DiscJuggler CDI"), ("cso", "→ CSO"), ("zso", "→ ZSO"), ("ecm", "→ ECM"),
+                       ("rvz", "→ RVZ (Wii / GameCube)"), ("wbfs", "→ WBFS (Wii)"), ("gcz", "→ GCZ"), ("wux", "→ WUX (Wii U)"), ("wud", "→ WUD (Wii U)"), ("verify", "Verify (CHD files)"),
                        ("recompress", "Recompress (CHD files)"))
 
     def set_all_targets(self, key, label):
@@ -3627,6 +5291,11 @@ class App:
             o["pbp_level"] = min(9, max(0, int(o["pbp_level"])))
         except (ValueError, tk.TclError):
             o["pbp_level"] = 6
+        for k, d in (("rvz_level", 5), ("rvz_chunk", 131072)):
+            try:
+                o[k] = int(o[k])
+            except (ValueError, tk.TclError):
+                o[k] = d
         return o
 
     BASE_PBP_TEXT = ("A PBP needs a small loader program from Sony to run on a real PSP or Vita. CHD Manager doesn't include it, "
@@ -3680,7 +5349,8 @@ class App:
             referenced.update(str(r).lower() for r in refs)
         for f in sorted(allf):
             e = f.suffix.lower()
-            if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso", ".pbp", ".cdi", ".mds", ".nrg", ".ccd", ".cso"):
+            if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso", ".pbp", ".cdi", ".mds", ".nrg", ".ccd", ".cso", ".zso", ".ecm",
+                                    ".gcm", ".gcz", ".rvz", ".wia", ".wbfs", ".ciso", ".wux", ".wud"):
                 found.append(f)
             elif e == ".bin" and str(f).lower() not in referenced:
                 found.append(f)
@@ -3907,6 +5577,10 @@ class App:
         gid = job.game_id
         dbf = find_gamedb()
         ent = load_gamedb(dbf).get(gid) if gid and dbf else None
+        if ent is None and job.container == "disc" and gid:        # GameCube / Wii: the name stored on the disc
+            di = job.disc_info
+            ent = dict(title=di["title"], main_title=di["title"], main_id=gid,
+                       region={"E": "USA", "P": "Europe", "J": "Japan", "K": "Korea"}.get(gid[3:4], ""))
         vals = {"%FILENAME%": stem, "%GAMEID%": gid, "%TITLE%": ent["title"] if ent else "",
                 "%MAINTITLE%": ent["main_title"] if ent else "", "%MAINGAMEID%": ent["main_id"] if ent else "",
                 "%REGION%": ent["region"] if ent else ""}
@@ -3990,6 +5664,12 @@ class App:
             iso = Path(outdir) / f"{tag}.iso"
             cso_to_iso(job.path, iso, prog, stopped)
             return iso
+        if job.container == "ecm":
+            out_bin = Path(outdir) / f"{tag}.bin"
+            ttype = ecm_decode(job.path, out_bin, prog, stopped) or "MODE1/2352"
+            cue = Path(outdir) / f"{tag}.cue"
+            cue.write_text(f'FILE "{out_bin.name}" BINARY\n  TRACK 01 {ttype}\n    INDEX 01 00:00:00\n', "utf-8")
+            return cue
         return unpack_cdi(job.path, outdir, tag, prog, stopped)
 
     def do_unpack(self, job, o):
@@ -4238,8 +5918,10 @@ class App:
             self.post("log", f"{job.path.name}: cannot read this CHD.", "err")
             return
         fmt = self.fmt_for(job, o)
-        if fmt == "cso":
-            return self.extract_to_cso(job, o)
+        if fmt in ("cso", "zso"):
+            return self.extract_to_cso(job, o, lz4=fmt == "zso")
+        if fmt == "ecm":
+            return self.extract_to_ecm(job, o)
         if fmt == "fix":
             return self.do_fix(job, o)
         if fmt == "pbp" or job.path.suffix.lower() == ".m3u":
@@ -4295,10 +5977,14 @@ class App:
             return self.do_extract_art(job, o)
         if t == "cue_fix":
             return self.do_fix(job, o)
-        if t == "cue" and job.container in ("pbp", "cdi", "image"):
+        if job.container == "disc":
+            return self.do_disc(job, o)
+        if t == "cue" and job.container in ("pbp", "cdi", "image", "ecm"):
             return self.do_unpack(job, o)
-        if t == "cso" and job.path.suffix.lower() == ".iso" and not job.wrap_cue:
-            return self.do_iso_to_cso(job, o)
+        if t in ("cso", "zso") and job.path.suffix.lower() == ".iso" and not job.wrap_cue:
+            return self.do_iso_to_cso(job, o, lz4=t == "zso")
+        if t in ("cso", "zso") and job.container == "cso":
+            return self.do_cso_convert(job, o, lz4=t == "zso")
         if t == "iso" and job.container == "cso":
             return self.do_cso_to_iso(job, o)
         return self.export_via_chd(job, o)
@@ -4409,10 +6095,10 @@ class App:
                 self.post("progress", pct)
         return prog
 
-    def write_cso_file(self, job, o, iso, part, out):
-        """iso -> part (a CSO), compared against the ISO when verifying is on, then moved to out. True on success."""
+    def write_cso_file(self, job, o, iso, part, out, lz4=False):
+        """iso -> part (a CSO, or a ZSO), compared against the ISO when verifying is on, then moved to out. True on success."""
         try:
-            iso_to_cso(iso, part, self.cso_progress(job, "Compressing"), lambda: self.stop_flag)
+            iso_to_cso(iso, part, self.cso_progress(job, "Compressing"), lambda: self.stop_flag, lz4=lz4)
             if o["verify_after"] and not verify_cso(part, iso, self.cso_progress(job, "Verifying"), lambda: self.stop_flag):
                 job.status, job.result = "Verify failed", "the finished CSO didn't match the ISO it was made from; it was discarded."
                 self.post("log", f"{job.path.name}: {job.result}", "err")
@@ -4434,15 +6120,42 @@ class App:
         self.post("log", f"OK  {out}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
         return True
 
-    def do_iso_to_cso(self, job, o):
-        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".cso"), o)
+    def do_iso_to_cso(self, job, o, lz4=False):
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".zso" if lz4 else ".cso"), o)
         if skip:
             return
         part = out.with_name(out.name + ".part")
-        self.post("log", f"\n{job.path.name}  [ISO → CSO]", "info")
+        self.post("log", f"\n{job.path.name}  [ISO → {'ZSO' if lz4 else 'CSO'}]", "info")
         try:
-            self.write_cso_file(job, o, job.path, part, out)
+            self.write_cso_file(job, o, job.path, part, out, lz4)
         finally:
+            part.unlink(missing_ok=True)
+
+    def do_cso_convert(self, job, o, lz4=False):
+        """CSO <-> ZSO, through a temporary ISO."""
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".zso" if lz4 else ".cso"), o)
+        if skip:
+            return
+        tmp = out.parent / f".{out.stem[:40]}.chdm_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        part = out.with_name(out.name + ".part")
+        self.post("log", f"\n{job.path.name}  [{'CSO → ZSO' if lz4 else 'ZSO → CSO'}]", "info")
+        try:
+            iso = tmp / "t.iso"
+            cso_to_iso(job.path, iso, self.cso_progress(job, "Unpacking"), lambda: self.stop_flag)
+            self.write_cso_file(job, o, iso, part, out, lz4)
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't unpack)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
             part.unlink(missing_ok=True)
 
     def do_cso_to_iso(self, job, o):
@@ -4475,11 +6188,11 @@ class App:
         job.status, job.result = "Done", f"→ {out.name}"
         self.post("log", f"OK  {out}", "ok")
 
-    def extract_to_cso(self, job, o):
-        """CHD -> CSO: a DVD CHD or a single-data-track CD CHD, through an ISO."""
+    def extract_to_cso(self, job, o, lz4=False):
+        """CHD -> CSO (or ZSO): a DVD CHD or a single-data-track CD CHD, through an ISO."""
         if job.disc != "DVD":
-            return self.extract_to_iso(job, o, to_cso=True)
-        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".cso"), o)
+            return self.extract_to_iso(job, o, to_cso=True, lz4=lz4)
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".zso" if lz4 else ".cso"), o)
         if skip:
             return
         tmp = out.parent / f".{out.stem[:40]}.chdm_tmp"
@@ -4488,16 +6201,251 @@ class App:
         try:
             iso = tmp / "t.iso"
             cmd = [CHDMAN, "extractdvd", "-i", str(job.path), "-o", str(iso), "-f"]
-            self.post("log", f"\n{job.path.name}  [DVD → CSO]", "info")
+            self.post("log", f"\n{job.path.name}  [DVD → {'ZSO' if lz4 else 'CSO'}]", "info")
             self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
             rc = self.run_proc(cmd, job, "Extracting")
             if self.stop_flag or rc != 0:
                 job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
                 return
-            self.write_cso_file(job, o, iso, out.with_name(out.name + ".part"), out)
+            self.write_cso_file(job, o, iso, out.with_name(out.name + ".part"), out, lz4)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             out.with_name(out.name + ".part").unlink(missing_ok=True)
+
+    # ---- Wii keys and Dolphin
+    def refresh_wii(self):
+        load_wii_keys(self.v["wii_common_key"].get(), self.v["wii_korean_key"].get())
+        WII_TOOL[0] = find_dolphintool(self.v["dolphintool"].get().strip())
+        WII_SCRUB[0] = bool(self.v["wbfs_scrub"].get())
+        if hasattr(self, "wii_status"):
+            self.wii_status.config(text=self.wii_status_text())
+        for j in getattr(self, "jobs", []):
+            if j.container == "disc" and not j.status.startswith("Done") and j.target not in [k for k, _ in j.available_targets()]:
+                j.set_target(j.default_target())
+        if hasattr(self, "tree"):
+            self.update_action_labels()
+
+    def wii_status_text(self):
+        return ("Wii key: found" if WII_KEYS[0] else "Wii key: none") + "   ·   " + \
+               (f"Dolphin tool: {WII_TOOL[0]}" if WII_TOOL[0] else "Dolphin tool: not found")
+
+    def pick_dolphintool(self):
+        p = filedialog.askopenfilename(title="Choose DolphinTool.exe", filetypes=[("DolphinTool", "DolphinTool.exe"), ("Programs", "*.exe")])
+        if p:
+            self.v["dolphintool"].set(p)
+
+    def open_keys_folder(self):
+        ensure_keys_dir()
+        try:
+            os.startfile(KEYS_DIR)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't open {KEYS_DIR}: {e}")
+
+    def themed_dialog(self, title):
+        w = tk.Toplevel(self.root)
+        w.title(title)
+        w.configure(bg=self.t["bg"])
+        w.transient(self.root)
+        w.resizable(False, False)
+        fr = ttk.Frame(w, padding=18)
+        fr.pack(fill="both", expand=True)
+        return w, fr
+
+    def place_dialog(self, w):
+        w.update_idletasks()
+        x = self.root.winfo_rootx() + max(20, (self.root.winfo_width() - w.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - w.winfo_reqheight()) // 3)
+        w.geometry(f"+{x}+{y}")
+
+    def show_keys_dialog(self):
+        w, fr = self.themed_dialog("Wii key")
+        ttk.Label(fr, justify="left", text="Paste your Wii common key: 32 hexadecimal characters.\n"
+                  "CHD Manager contains no keys and never downloads them.").grid(row=0, column=0, columnspan=3, sticky="w")
+        c, k = tk.StringVar(value=self.v["wii_common_key"].get()), tk.StringVar(value=self.v["wii_korean_key"].get())
+        ttk.Label(fr, text="Common key").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(fr, textvariable=c, width=42).grid(row=1, column=1, columnspan=2, padx=8, pady=(12, 0))
+        ttk.Label(fr, text="Korean key (only for Korean discs)").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(fr, textvariable=k, width=42).grid(row=2, column=1, columnspan=2, padx=8, pady=(6, 0))
+
+        def save():
+            for label, var in (("common", c), ("Korean", k)):
+                if var.get().strip() and not parse_wii_keys(var.get().strip().encode("ascii", "ignore"))[0]:
+                    messagebox.showerror(APP_NAME, f"The {label} key must be 32 hexadecimal characters.", parent=w)
+                    return
+            self.v["wii_common_key"].set(c.get().strip())
+            self.v["wii_korean_key"].set(k.get().strip())
+            self.save_settings()
+            w.destroy()
+        bf = ttk.Frame(fr)
+        bf.grid(row=3, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(bf, text="Open the keys folder", command=self.open_keys_folder).pack(side="left", padx=(0, 20))
+        ttk.Button(bf, text="Cancel", command=w.destroy).pack(side="left", padx=4)
+        ttk.Button(bf, text="Save", style="Accent.TButton", command=save).pack(side="left")
+        self.place_dialog(w)
+        w.grab_set()
+
+    def wii_warning(self):
+        """At start: tell the user that Wii conversions are off because there is neither a key nor Dolphin on this PC."""
+        if WII_KEYS[0] or WII_TOOL[0] or self.v["wii_warn_off"].get():
+            return
+        w, fr = self.themed_dialog("Wii keys needed")
+        ttk.Label(fr, justify="left", wraplength=430, text=(
+            "Converting a Wii disc to RVZ, WIA or WBFS needs your own Wii key, or Dolphin installed on this PC. "
+            "Neither was found, so those conversions are switched off.\n\n"
+            "Everything else works without it, including GameCube and Wii U discs and every other format.\n\n"
+            "Add your key now? You can also put it in the keys folder next to this program, or point Settings at DolphinTool.exe.")
+                  ).grid(row=0, column=0, columnspan=2, sticky="w")
+        dont = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fr, text="Don't show this again", variable=dont).grid(row=1, column=0, sticky="w", pady=(14, 0))
+
+        def close(add):
+            if dont.get():
+                self.v["wii_warn_off"].set(True)
+                self.save_settings()
+            w.destroy()
+            if add:
+                self.show_keys_dialog()
+        bf = ttk.Frame(fr)
+        bf.grid(row=1, column=1, sticky="e", pady=(14, 0))
+        ttk.Button(bf, text="Not now", command=lambda: close(False)).pack(side="left", padx=4)
+        ttk.Button(bf, text="Add key…", style="Accent.TButton", command=lambda: close(True)).pack(side="left")
+        w.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self.place_dialog(w)
+
+    def dolphin_convert(self, job, o, t, part, method):
+        """Wii disc -> RVZ/WIA with the user's own DolphinTool.exe (used when there is no Wii key). True on success."""
+        tool = find_dolphintool(o.get("dolphintool", ""))
+        if not tool:
+            job.status, job.result = "Failed (key needed)", "this needs your Wii key or DolphinTool.exe (see Settings, Formats)"
+            self.post("log", f"{job.path.name}: {job.result}", "err")
+            return False
+        name = {v: k for k, v in self.RVZ_METHODS.items()}[method]
+        chunk = o["rvz_chunk"] if t == "rvz" else 0x200000
+        udir = Path(tempfile.mkdtemp(prefix="chdm_dolphin_"))
+        try:
+            cmd = [tool, "convert", "-i", str(job.path), "-o", str(part), "-f", t, "-b", str(chunk), "-c", name, "-l",
+                   str(o["rvz_level"]), "-u", str(udir)]
+            self.post("log", "No Wii key, so Dolphin's own tool does the work:", "info")
+            self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+            rc = self.run_proc(cmd, job, "Converting with Dolphin")
+        finally:
+            shutil.rmtree(udir, ignore_errors=True)
+        if self.stop_flag or rc != 0 or not part.exists():
+            job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+            return False
+        return True
+
+    # ---- GameCube / Wii discs (Dolphin's formats)
+    DISC_EXT = {"iso": ".iso", "rvz": ".rvz", "wia": ".wia", "gcz": ".gcz", "ciso": ".ciso", "wbfs": ".wbfs", "wud": ".wud",
+                "wux": ".wux"}
+    RVZ_METHODS = {"none": 0, "bzip2": 2, "lzma": 3, "lzma2": 4, "zstd": 5}
+
+    def do_disc(self, job, o):
+        t = (job.target or "").partition("_d")[0]
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, self.DISC_EXT[t]), o)
+        if skip:
+            return
+        part = out.with_name(out.name + ".part")
+        job.out_path = out
+        fmt = job.disc_info.get("format", "ISO")
+        self.post("log", f"\n{job.path.name}  [{job.platform}: {fmt} → {t.upper()}]", "info")
+        prog = self.cso_progress(job, "Converting")
+        stop = lambda: self.stop_flag  # noqa: E731
+        src = None
+        try:
+            src = open_disc(job.path)
+            if t in ("iso", "wud"):
+                disc_to_iso(src, part, prog, stop)
+            elif t == "wux":
+                write_wux(src, part, prog, stop)
+            elif t == "gcz":
+                write_gcz(src, part, prog, stop)
+            elif t == "ciso":
+                write_ciso(src, part, prog, stop)
+            elif t == "wbfs":
+                write_wbfs(src, part, prog, stop, scrub=bool(o["wbfs_scrub"]))
+            else:
+                method = self.RVZ_METHODS.get(str(o["rvz_method"]).lower(), 5)
+                if t == "wia" and method == 5:
+                    self.post("log", "WIA can't use zstd; using LZMA2 instead.", "info")
+                if job.platform == "Wii" and not WII_KEYS[0]:
+                    if not self.dolphin_convert(job, o, t, part, method):
+                        return
+                else:
+                    write_rvz(src, part, prog, stop, rvz=t == "rvz", method=method, level=o["rvz_level"], chunk=o["rvz_chunk"])
+            if o["verify_after"] and t not in ("iso", "wud"):
+                if not verify_disc_file(part, src, t, self.cso_progress(job, "Verifying"), stop):
+                    job.status, job.result = "Verify failed", "the finished file didn't match the disc it was made from; it was discarded."
+                    self.post("log", f"{job.path.name}: {job.result}", "err")
+                    return
+            os.replace(part, out)
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't convert)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        except (OSError, struct.error, zlib.error, lzma.LZMAError) as e:
+            job.status, job.result = "Failed (disk or file)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        finally:
+            if src:
+                src.close()
+            part.unlink(missing_ok=True)
+        job.out_size = out.stat().st_size
+        job.status, job.result = "Done", f"→ {out.name}"
+        self.post("log", f"OK  {out}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
+
+    def extract_to_ecm(self, job, o):
+        """CD CHD with one raw data track -> ECM."""
+        out, _, skip = self.handle_exists(job, self.output_path(job, o, ".ecm"), o)
+        if skip:
+            return
+        tmp = out.parent / f".{out.stem[:40]}.chdm_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        part = out.with_name(out.name + ".part")
+        stop = lambda: self.stop_flag  # noqa: E731
+        try:
+            cue = tmp / "t.cue"
+            cmd = [CHDMAN, "extractcd", "-i", str(job.path), "-o", str(cue), "-f"]
+            self.post("log", f"\n{job.path.name}  [CD → ECM]", "info")
+            self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+            rc = self.run_proc(cmd, job, "Extracting")
+            if self.stop_flag or rc != 0:
+                job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+                return
+            tracks = parse_cue_tracks(cue)
+            if len(tracks) != 1 or tracks[0][1] not in ("MODE1/2352", "MODE2/2352"):
+                job.status, job.result = "Failed (can't be an ECM)", "ECM needs one track of raw 2352-byte sectors."
+                self.post("log", f"{job.path.name}: {job.result}", "err")
+                return
+            src_bin = parse_cue(cue)[0]
+            ecm_encode(src_bin, part, self.cso_progress(job, "Compressing"), stop)
+            if o["verify_after"] and not verify_ecm(part, src_bin, self.cso_progress(job, "Verifying"), stop):
+                job.status, job.result = "Verify failed", "the finished ECM didn't decode back to the disc; it was discarded."
+                self.post("log", f"{job.path.name}: {job.result}", "err")
+                return
+            os.replace(part, out)
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't write)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            part.unlink(missing_ok=True)
+        job.out_path, job.out_size = out, out.stat().st_size
+        job.status, job.result = "Done", f"→ {out.name}"
+        self.post("log", f"OK  {out}  ({fmt_size(job.size)} → {fmt_size(job.out_size)})", "ok")
 
     # ---- artwork for PBPs
     def find_art(self, o, stem, game_id, title):
@@ -4774,9 +6722,9 @@ class App:
                 except OSError:
                     pass
 
-    def extract_to_iso(self, job, o, to_cso=False):
-        """CD CHD -> .iso (or .cso). Only possible when the disc is one data track; anything else would lose data."""
-        out = self.output_path(job, o, ".cso" if to_cso else ".iso")
+    def extract_to_iso(self, job, o, to_cso=False, lz4=False):
+        """CD CHD -> .iso (or .cso / .zso). Only possible when the disc is one data track; anything else would lose data."""
+        out = self.output_path(job, o, (".zso" if lz4 else ".cso") if to_cso else ".iso")
         out, force, skip = self.handle_exists(job, out, o)
         if skip:
             return
@@ -4787,7 +6735,7 @@ class App:
             cue = tmp / "t.cue"
             cmd = [CHDMAN, "extractcd", "-i", str(job.path), "-o", str(cue), "-f"]
             job.out_path = out
-            self.post("log", f"\n{job.path.name}  [CD → {'CSO' if to_cso else 'ISO'}]", "info")
+            self.post("log", f"\n{job.path.name}  [CD → {('ZSO' if lz4 else 'CSO') if to_cso else 'ISO'}]", "info")
             self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
             rc = self.run_proc(cmd, job, "Extracting")
             if self.stop_flag or rc != 0:
@@ -4838,7 +6786,7 @@ class App:
                 job.status = "Stopped"
                 return
             if to_cso:
-                self.write_cso_file(job, o, part, out.with_name(out.name + ".part2"), out)
+                self.write_cso_file(job, o, part, out.with_name(out.name + ".part2"), out, lz4)
                 return
             os.replace(part, out)
             ok = DiscReader(out, 2048, 0).sector(16)[1:6] == b"CD001"
@@ -5472,6 +7420,12 @@ def cli_main(argv):
     ap.add_argument("--hunk", metavar="BYTES", help="CHD hunk size")
     ap.add_argument("--threads", type=int, default=0, metavar="N", help="CHD processors (default: all)")
     ap.add_argument("--level", type=int, choices=range(10), metavar="0-9", help="PBP compression (default 6)")
+    ap.add_argument("--wii-key", metavar="HEX", help="your Wii common key (32 hex characters); or put it in the keys folder")
+    ap.add_argument("--dolphintool", metavar="EXE", help="your DolphinTool.exe, used for Wii RVZ/WIA when there is no key")
+    ap.add_argument("--rvz-method", choices=("zstd", "lzma", "lzma2", "bzip2", "none"), help="RVZ/WIA compression (default zstd)")
+    ap.add_argument("--rvz-level", type=int, choices=range(1, 10), metavar="1-9", help="RVZ/WIA compression level (default 5)")
+    ap.add_argument("--rvz-block", type=int, metavar="KIB", help="RVZ block size in KiB, 32 to 2048 (default 128)")
+    ap.add_argument("--no-scrub", action="store_true", help="WBFS: keep all data, don't leave out what nothing uses")
     ap.add_argument("--art", metavar="DIR", help="your PBP artwork folder (one subfolder per game)")
     ap.add_argument("--no-cards", action="store_true", help="don't draw title cards for PBPs without artwork")
     ap.add_argument("--base-pbp", metavar="FILE", help="base PBP for a real PSP/Vita")
@@ -5508,7 +7462,7 @@ def cli_main(argv):
     code = 1
     try:
         for k, d in DEFAULTS.items():                    # only the machine's own paths come from the saved settings
-            if k in app.v and k not in ("base_pbp", "art_dir"):
+            if k in app.v and k not in ("base_pbp", "art_dir", "dolphintool", "wii_common_key", "wii_korean_key"):
                 app.v[k].set(d)
         v = app.v
         if a.output:
@@ -5528,6 +7482,18 @@ def cli_main(argv):
         v["threads"].set(a.threads)
         if a.level is not None:
             v["pbp_level"].set(a.level)
+        if a.wii_key:
+            v["wii_common_key"].set(a.wii_key)
+        if a.dolphintool:
+            v["dolphintool"].set(a.dolphintool)
+        if a.rvz_method:
+            v["rvz_method"].set(a.rvz_method)
+        if a.rvz_level:
+            v["rvz_level"].set(a.rvz_level)
+        if a.rvz_block:
+            v["rvz_chunk"].set(a.rvz_block * 1024)
+        if a.no_scrub:
+            v["wbfs_scrub"].set(False)
         if a.art:
             v["art_dir"].set(a.art)
         if a.base_pbp:
@@ -5565,7 +7531,9 @@ def cli_main(argv):
         for j in app.jobs:
             ok = [k for k, _ in j.available_targets()]
             if a.to and a.to not in ok:
-                say(f"FAIL {j.path.name}: can't become '{a.to}' (it can become: {', '.join(ok) or 'nothing'})")
+                hint = ("; RVZ, WIA and WBFS from a Wii disc need your Wii key (--wii-key, or the keys folder) or DolphinTool.exe (--dolphintool)"
+                        if j.platform == "Wii" and a.to in ("rvz", "wia", "wbfs") else "")
+                say(f"FAIL {j.path.name}: can't become '{a.to}' (it can become: {', '.join(ok) or 'nothing'}){hint}")
                 bad += 1
                 continue
             if a.to:
