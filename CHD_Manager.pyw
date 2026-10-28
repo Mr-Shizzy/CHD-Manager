@@ -1219,6 +1219,51 @@ def cook_to_raw(iso, dst, progress, stopped):
     progress(1.0)
 
 
+def _edc(data):
+    c = 0
+    for w in struct.unpack("<%dH" % (len(data) // 2), data):
+        c ^= w
+        c = _EDC_T2[c & 0xFFFF] ^ (c >> 16)
+    return c
+
+
+def fix_sector(s):
+    """A raw Mode 2 Form 1 sector with its EDC and ECC recomputed from its own data (header and subheader kept).
+    Any other kind of sector (audio, Form 2, Mode 1) is returned as it was."""
+    import operator
+    if len(s) != 2352 or s[:12] != b"\x00" + b"\xff" * 10 + b"\x00" or s[15] != 2 or s[18] & 0x20 or s[22] & 0x20:
+        return s
+    _ecc_setup()
+    body = bytearray(s[:2072])
+    body += struct.pack("<I", _edc(bytes(body[16:2072])))
+    src = bytes(4) + bytes(body[16:2076])
+    p = _ecc_parity(src[:2064], _ECC_P_TABLES, 86)
+    q = _ecc_parity(bytes(operator.itemgetter(*_ECC_Q_PERM)(src + p)), _ECC_Q_TABLES, 52)
+    return bytes(body) + p + q
+
+
+def repair_bin(src, dst, progress, stopped):
+    """Copy a raw BIN, rebuilding the EDC/ECC of every Mode 2 Form 1 sector. -> number of sectors that changed."""
+    total = max(1, os.path.getsize(src) // 2352)
+    changed = 0
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        n = 0
+        while True:
+            s = f.read(2352)
+            if not s:
+                break
+            fixed = fix_sector(s)
+            changed += fixed != s
+            g.write(fixed)
+            n += 1
+            if n % 512 == 0:
+                progress(n / total)
+                if stopped():
+                    raise UnpackError("stopped")
+    progress(1.0)
+    return changed
+
+
 def sniff_raw_image(path):
     """'MODE1/2352' or 'MODE2/2352' if the file starts with a raw CD sector (sync pattern), else '' (a plain image)."""
     try:
@@ -1329,7 +1374,7 @@ def build_sfo(entries):
     return b"\0PSF" + struct.pack("<IIII", 0x101, key_off, key_off + len(keys), len(entries)) + index + keys + data
 
 
-def ps1_boot_id(path, stride_off, stride=2352):
+def ps1_boot_id(path, stride_off, stride=2352, ps2=False):
     """The game code ('SLUS01545') from the BOOT line of SYSTEM.CNF, read straight from the extracted BIN; '' if
     this isn't a PlayStation 1 disc."""
     try:
@@ -1351,7 +1396,9 @@ def ps1_boot_id(path, stride_off, stride=2352):
             if name.startswith("SYSTEM.CNF"):
                 ext = struct.unpack("<I", data[pos + 2:pos + 6])[0]
                 txt = r.sector(ext).decode("latin1", "replace")
-                m = re.search(r"BOOT\s*=\s*cdrom:\\?(?:.*[\\/])?([A-Z]{4})[_-]?(\d{3})\.?(\d{2})", txt, re.I)
+                pat = r"BOOT2\s*=\s*cdrom0:\\?(?:.*[\\/])?([A-Z]{4})[_-]?(\d{3})\.?(\d{2})" if ps2 else \
+                    r"BOOT\s*=\s*cdrom:\\?(?:.*[\\/])?([A-Z]{4})[_-]?(\d{3})\.?(\d{2})"
+                m = re.search(pat, txt, re.I)
                 return (m.group(1) + m.group(2) + m.group(3)).upper() if m else ""
             pos += ln
     except (OSError, struct.error, IndexError):
@@ -2013,10 +2060,11 @@ def target_label(key):
 TARGET_LABELS = {"chd": "→ CHD", "cue": "→ CUE/BIN", "cue_split": "→ CUE/BIN, one BIN per track",
                  "cue_single": "→ CUE/BIN, one single BIN", "iso": "→ ISO", "gdi": "→ GDI",
                  "pbp": "→ PlayStation PBP", "cdi": "→ DiscJuggler CDI (experimental)", "cso": "→ CSO (compressed ISO)",
-                 "verify": "Verify only", "recompress": "Recompress", "auto": "Extract", "art": "→ Artwork images (PNG)"}
+                 "verify": "Verify only", "recompress": "Recompress", "auto": "Extract", "art": "→ Artwork images (PNG)",
+                 "cue_fix": "→ CUE/BIN, error correction rebuilt"}
 # how the CHD extraction code names each target
 TARGET_FMT = {"cue": "auto", "cue_split": "split", "cue_single": "single", "iso": "iso", "gdi": "auto", "pbp": "pbp",
-              "cdi": "cdi", "cso": "cso", "auto": "auto"}
+              "cdi": "cdi", "cso": "cso", "auto": "auto", "cue_fix": "fix"}
 CUE_TYPE = {"AUDIO": "AUDIO", "MODE1/2048": "MODE1", "MODE1/2352": "MODE1_RAW", "MODE2/2352": "MODE2_RAW"}
 
 
@@ -2107,6 +2155,8 @@ class Job:
                     keys.append("pbp")
                 if raw:
                     keys.append("cdi")
+                if raw and data[0].startswith("MODE2"):
+                    keys.append("cue_fix")
             elif self.disc == "GD-ROM":
                 keys.append("gdi")
             elif self.disc == "DVD":
@@ -2132,6 +2182,8 @@ class Job:
                         keys.append("pbp")
                     if ext != ".cdi":
                         keys.append("cdi")
+                    if data[0].startswith("MODE2"):
+                        keys.append("cue_fix")
                 elif ext in (".iso", ".cso") and self.platform == "PS1":
                     keys.append("pbp")            # a plain PS1 ISO: raw sectors are rebuilt for the PBP
         if self.container == "pbp" and self.disc_count > 1:
@@ -2154,7 +2206,7 @@ class Job:
         try:
             if ext == ".pbp":
                 return pbp_game_id(self.path)
-            if self.platform != "PS1":
+            if self.platform not in ("PS1", "PS2"):
                 return ""
             if ext == ".cue":
                 c = cue_data_start(self.path)
@@ -2163,7 +2215,7 @@ class Job:
                 files = [self.path] if ext in (".iso", ".bin") else []
             for f in files:
                 for stride, off in ((2352, 24), (2352, 16), (2048, 0)):
-                    gid = ps1_boot_id(f, off, stride)
+                    gid = ps1_boot_id(f, off, stride, ps2=self.platform == "PS2")
                     if gid:
                         return gid
         except (OSError, ValueError, struct.error):
@@ -4050,6 +4102,8 @@ class App:
         fmt = self.fmt_for(job, o)
         if fmt == "cso":
             return self.extract_to_cso(job, o)
+        if fmt == "fix":
+            return self.do_fix(job, o)
         if fmt == "pbp" or job.path.suffix.lower() == ".m3u":
             if fmt != "pbp":
                 job.status, job.result = "Failed (choose PBP)", "A playlist can only be combined into a PBP: choose PlayStation PBP under 'CHD files'."
@@ -4101,6 +4155,8 @@ class App:
         t = (job.target or "").partition("_d")[0]
         if t == "art":
             return self.do_extract_art(job, o)
+        if t == "cue_fix":
+            return self.do_fix(job, o)
         if t == "cue" and job.container in ("pbp", "cdi", "image"):
             return self.do_unpack(job, o)
         if t == "cso" and job.path.suffix.lower() == ".iso" and not job.wrap_cue:
@@ -4338,6 +4394,78 @@ class App:
         job.out_path = out
         job.status, job.result = "Done", f"→ {out.name}\\ ({', '.join(made)})"
         self.post("log", f"OK  {out}: {', '.join(made)}", "ok")
+
+    def do_fix(self, job, o):
+        """→ CUE/BIN with the EDC/ECC of every Mode 2 Form 1 sector rebuilt (audio, Form 2 and Mode 1 sectors stay as they are)."""
+        stem = self.out_stem(job, o)
+        tmp = self.output_path(job, o, ".x").parent / f".{stem[:40]}.chdm_fix"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        ext, made = job.path.suffix.lower(), None
+        last = [-1]
+
+        def prog(label):
+            def f(x):
+                pct = int(100 * x)
+                if pct != last[0]:
+                    last[0] = pct
+                    job.status = f"{label} {pct}%"
+                    self.post("job", job)
+                    self.post("progress", pct)
+            return f
+        try:
+            self.post("log", f"\n{job.path.name}  [rebuilding EDC/ECC]", "info")
+            if ext == ".chd":
+                cue = tmp / "t.cue"
+                cmd = [CHDMAN, "extractcd", "-i", str(job.path), "-o", str(cue), "-f"]
+                self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
+                rc = self.run_proc(cmd, job, "Extracting")
+                if self.stop_flag or rc != 0:
+                    job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
+                    return
+            elif job.container:
+                cue = self.unpack_job(job, pbp_discs(job.path)[0] if job.container == "pbp" else None, tmp, "t", prog("Unpacking"))
+            elif job.wrap_cue:
+                cue = tmp / "t.cue"
+                cue.write_text(f'FILE "{job.path}" BINARY\n  TRACK 01 {job.wrap_cue}\n    INDEX 01 00:00:00\n', "utf-8")
+            else:
+                cue = job.path
+            files = list(dict.fromkeys(parse_cue(cue)))
+            if not files or not all(f.is_file() for f in files):
+                job.status, job.result = "Failed (can't read disc)", "the CUE's data files weren't found"
+                self.post("log", f"{job.path.name}: {job.result}", "err")
+                return
+            multi = len(files) > 1
+            out_cue = self.output_path(job, o, ".cue", multi=multi)
+            out_cue, force, skip = self.handle_exists(job, out_cue, o)
+            if skip:
+                return
+            names = {f.name.lower(): (f"{out_cue.stem}.bin" if not multi else f"{out_cue.stem} (Track {i + 1}).bin") for i, f in enumerate(files)}
+            changed = 0
+            part_files = []
+            for f in files:
+                dst = out_cue.with_name(names[f.name.lower()])
+                part_files.append(dst)
+                changed += repair_bin(f, dst, prog("Rebuilding"), lambda: self.stop_flag)
+            text = cue.read_text("utf-8", "replace")
+            text = re.sub(r'(FILE\s+)(?:"([^"]+)"|(\S+))', lambda mt: mt.group(1) + '"' + names.get(Path(mt.group(2) or mt.group(3)).name.lower(), "x.bin") + '"', text, flags=re.I)
+            out_cue.write_text(text, "utf-8")
+            made = out_cue
+            job.out_path, job.out_size = out_cue, sum(p.stat().st_size for p in part_files)
+            job.status = "Done"
+            job.result = f"→ {out_cue.name}" + (f" ({changed} sectors changed)" if changed else " (nothing needed fixing)")
+            self.post("log", f"OK  {out_cue}: {changed} sector(s) changed.", "ok")
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't read)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def extract_to_pbp(self, job, o):
         """CD CHD (or an .m3u playlist of CHDs, one per disc) -> one .pbp. PlayStation 1 discs only."""
