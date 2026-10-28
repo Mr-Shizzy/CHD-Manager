@@ -43,7 +43,7 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 CD_MAX_BYTES = 737_280_000          # 80-minute CD: 360,000 sectors * 2048 bytes
 SRC_EXTS = {".cue", ".gdi", ".toc", ".iso", ".bin", ".pbp", ".cdi", ".mds", ".mdf", ".nrg", ".ccd", ".img", ".sub", ".m3u", ".cso"}
-UNSUPPORTED_EXTS = {".zip", ".7z", ".rar"}
+ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz"}
 CHDMAN = None                        # path to chdman.exe, set at startup
 
 THEMES = {
@@ -1121,6 +1121,116 @@ def image_platform(tracks):
     return ""
 
 
+# ------------------------------------------------------ plain 2048-byte ISO -> raw 2352-byte sectors (for PBP)
+def _edc_tables():
+    t1 = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ (0xD8018001 if c & 1 else 0)
+        t1.append(c)
+    t2 = []
+    for x in range(65536):                    # two zero bytes fed to a CRC whose low 16 bits are x
+        c = x
+        for _ in range(2):
+            c = (c >> 8) ^ t1[c & 0xFF]
+        t2.append(c)
+    return t2
+
+
+def _ecc_tables():
+    f = [((i << 1) ^ (0x11D if i & 0x80 else 0)) & 0xFF for i in range(256)]
+    b = [0] * 256
+    for i in range(256):
+        b[i ^ f[i]] = i
+
+    def kth(n):                               # byte -> parity contribution of a byte that is followed by n more steps
+        out = bytearray(256)
+        for t in range(256):
+            v = t
+            for _ in range(n + 1):
+                v = f[v]
+            out[t] = b[v ^ t]
+        return bytes(out)
+    return kth
+
+
+_EDC_T2 = None
+_ECC_P_TABLES = _ECC_Q_TABLES = _ECC_Q_PERM = None
+
+
+def _ecc_setup():
+    global _EDC_T2, _ECC_P_TABLES, _ECC_Q_TABLES, _ECC_Q_PERM
+    if _EDC_T2 is not None:
+        return
+    _EDC_T2 = _edc_tables()
+    kth = _ecc_tables()
+    _ECC_P_TABLES = [kth(24 - k) for k in range(24)]
+    _ECC_Q_TABLES = [kth(43 - k) for k in range(43)]
+    perm = [0] * (52 * 43)
+    for major in range(52):
+        index = (major >> 1) * 86 + (major & 1)
+        for minor in range(43):
+            perm[minor * 52 + major] = index
+            index += 88
+            if index >= 2236:
+                index -= 2236
+    _ECC_Q_PERM = perm
+
+
+def _ecc_parity(rows, tables, width):
+    a = b = 0
+    for k, tab in enumerate(tables):
+        row = rows[k * width:(k + 1) * width]
+        a ^= int.from_bytes(row.translate(tab), "little")
+        b ^= int.from_bytes(row, "little")
+    return a.to_bytes(width, "little") + (a ^ b).to_bytes(width, "little")
+
+
+def raw_form1_sector(lba, user, sub=b"\x00\x00\x08\x00\x00\x00\x08\x00"):
+    """The 2352-byte Mode 2 Form 1 sector for 2048 bytes of data: sync, MSF header, subheader, data, EDC and ECC."""
+    import operator
+    _ecc_setup()
+    msf = lba + 150
+    body = bytearray(b"\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00")
+    body += bytes((_bcd(msf // 4500), _bcd(msf // 75 % 60), _bcd(msf % 75), 2)) + sub + user
+    c = 0
+    for w in struct.unpack("<1028H", body[16:2072]):
+        c ^= w
+        c = _EDC_T2[c & 0xFFFF] ^ (c >> 16)
+    body += struct.pack("<I", c)
+    src = bytes(4) + bytes(body[16:2076])                 # the address is treated as zero for Mode 2
+    p = _ecc_parity(src[:2064], _ECC_P_TABLES, 86)
+    q = _ecc_parity(bytes(operator.itemgetter(*_ECC_Q_PERM)(src + p)), _ECC_Q_TABLES, 52)
+    return bytes(body) + p + q
+
+
+def cook_to_raw(iso, dst, progress, stopped):
+    """A plain ISO (2048-byte sectors) -> one raw MODE2/2352 BIN. The usual way of making a PS1 disc image from an ISO:
+    data sectors are rebuilt in full, but CD-XA audio and video (Form 2 sectors) can't come from a plain ISO."""
+    total = os.path.getsize(iso) // 2048
+    with open(iso, "rb") as f, open(dst, "wb") as g:
+        for n in range(total):
+            g.write(raw_form1_sector(n, f.read(2048)))
+            if n % 512 == 0:
+                progress(n / max(total, 1))
+                if stopped():
+                    raise UnpackError("stopped")
+    progress(1.0)
+
+
+def sniff_raw_image(path):
+    """'MODE1/2352' or 'MODE2/2352' if the file starts with a raw CD sector (sync pattern), else '' (a plain image)."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(16)
+    except OSError:
+        return ""
+    if len(h) == 16 and h[:12] == b"\x00" + b"\xff" * 10 + b"\x00" and h[15] in (1, 2):
+        return f"MODE{h[15]}/2352"
+    return ""
+
+
 # ------------------------------------------------------ CHD -> PBP (PlayStation 1), written from the layout notes above
 PBP_BLOCK = 16 * 2352
 
@@ -1219,11 +1329,11 @@ def build_sfo(entries):
     return b"\0PSF" + struct.pack("<IIII", 0x101, key_off, key_off + len(keys), len(entries)) + index + keys + data
 
 
-def ps1_boot_id(path, stride_off):
+def ps1_boot_id(path, stride_off, stride=2352):
     """The game code ('SLUS01545') from the BOOT line of SYSTEM.CNF, read straight from the extracted BIN; '' if
     this isn't a PlayStation 1 disc."""
     try:
-        r = DiscReader(path, 2352, stride_off)
+        r = DiscReader(path, stride, stride_off)
         pvd = r.sector(16)
         if pvd[1:6] != b"CD001":
             return ""
@@ -1264,6 +1374,52 @@ def _disc_head(lay, game_id, title, multi):
     head[d2 + 8:d2 + 8 + len(t)] = t
     head[d2 + 136] = 3
     return head
+
+
+ART_FILES = (("icon0", "ICON0.PNG", (144, 80)), ("icon1", "ICON1.PMF", None), ("pic0", "PIC0.PNG", (310, 180)),
+             ("pic1", "PIC1.PNG", (480, 272)), ("snd0", "SND0.AT3", None))
+
+
+def read_art_folder(folder):
+    """Your own PBP artwork: ICON0.PNG, ICON1.PMF, PIC0.PNG, PIC1.PNG and SND0.AT3 in a folder (any may be missing).
+    -> (dict of what was found, [warnings]); the dict is empty when the folder has none of them."""
+    art, warn = {}, []
+    folder = Path(folder)
+    if not folder.is_dir():
+        return art, warn
+    have = {p.name.upper(): p for p in folder.iterdir() if p.is_file()}
+    for key, name, size in ART_FILES:
+        p = have.get(name)
+        if not p:
+            continue
+        data = p.read_bytes()
+        if size:
+            if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
+                warn.append(f"{name} isn't a PNG and was ignored")
+                continue
+            w, h = struct.unpack(">II", data[16:24])
+            if (w, h) != size:
+                warn.append(f"{name} is {w}x{h}; a PSP expects {size[0]}x{size[1]}")
+        art[key] = data
+    return art, warn
+
+
+def extract_pbp_art(pbp, outdir):
+    """Write the icon, pictures and sound stored in a PBP into outdir. -> [file names written]"""
+    with open(pbp, "rb") as f:
+        head = f.read(0x28)
+        if len(head) < 0x28 or head[:4] != b"\x00PBP":
+            raise UnpackError("this isn't a PBP file")
+        o = struct.unpack("<10I", head)
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        made = []
+        for i, (_, name, _) in enumerate(ART_FILES):
+            f.seek(o[3 + i])
+            data = f.read(o[4 + i] - o[3 + i])
+            if data:
+                (Path(outdir) / name).write_bytes(data)
+                made.append(name)
+    return made
 
 
 def read_base_pbp(path):
@@ -1313,7 +1469,7 @@ PBP_MULTI_BLOCK_B = bytes.fromhex(
     "8c0eae9d398cfe246521ad2d65a961dfd44a1303b4cd325fbdb0f4f98a70be1e392c7dc0c1c66b81aa3c0653941bcee54416cfdbb1e3897ba2d2e7d6c1266b588d2ce6c31597d029c91681b6cc42ee0c2810eaf26b6f903005be4a2f4abcdce587ce19b980deb832ddad8967e0927889e8dc451d0cbe8b994d50b3d658966175")
 
 
-def write_pbp(out_path, layouts, game_ids, title, progress, stopped, donor=None):
+def write_pbp(out_path, layouts, game_ids, title, progress, stopped, donor=None, level=6, art=None):
     """Write layouts (one per disc, from cue_layout) as a PBP. One disc -> PSISOIMG0000, several -> PSTITLEIMG000000.
     With donor (from read_base_pbp) the PBP also carries the loader, icon and boot logo a real PSP needs."""
     n = len(layouts)
@@ -1321,6 +1477,9 @@ def write_pbp(out_path, layouts, game_ids, title, progress, stopped, donor=None)
                      ("LICENSE", "Copyright(C) Sony Computer Entertainment America Inc.", 512), ("PARENTAL_LEVEL", 3, 4),
                      ("PSP_SYSTEM_VER", "3.01", 8), ("REGION", 0x8000, 4), ("TITLE", title, 128)])
     res = [donor[k] for k in ("icon0", "icon1", "pic0", "pic1", "snd0", "loader")] if donor else [b""] * 6
+    for i, k in enumerate(("icon0", "icon1", "pic0", "pic1", "snd0")):      # your own artwork replaces the base PBP's
+        if art and art.get(k):
+            res[i] = art[k]
     offs, pos = [0x28], 0x28 + len(sfo)
     for r in res:
         offs.append(pos)
@@ -1358,10 +1517,12 @@ def write_pbp(out_path, layouts, game_ids, title, progress, stopped, donor=None)
             g.write(bytes(base + 0x100000 - g.tell()))
             off = 0
             for b, block in enumerate(iter_disc_blocks(lay)):
-                comp = zlib.compressobj(6, zlib.DEFLATED, -15)
-                z = comp.compress(block) + comp.flush()
-                if len(z) >= PBP_BLOCK:
-                    z = block
+                z = block
+                if level > 0:
+                    comp = zlib.compressobj(level, zlib.DEFLATED, -15)
+                    z = comp.compress(block) + comp.flush()
+                    if len(z) >= PBP_BLOCK:
+                        z = block
                 struct.pack_into("<IH", index, b * 32, off, len(z))
                 g.write(z)
                 off += len(z)
@@ -1752,11 +1913,107 @@ def verify_cso(cso, iso, progress, stopped):
         return f.read(1) == b""
 
 
+def cso_platform(path):
+    """Platform of the disc inside a CSO, found by unpacking its first 2 MB."""
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="chdm_sniff_"))
+        try:
+            head = tmp / "head.iso"
+            with open(head, "wb") as g:
+                for i, (_, data) in enumerate(iter_cso(path)):
+                    g.write(data)
+                    if i >= 1000:
+                        break
+            return sniff_platform(head)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except (UnpackError, OSError):
+        return ""
+
+
+# ------------------------------------------------------ game IDs and titles (for naming output files)
+GAMEDB_FILE = ("gameInfo.db", "https://raw.githubusercontent.com/RupertAvery/PSXPackager/453c0e7b11fa46d78fa1939473923699894fde03/"
+               "Popstation.Database/Resources/gameInfo.db", "fdea8792f8f173e434fd094038e81c14b77db71c00d1c64a11f6ce5b49c4cce9")
+_GAMEDB = {}
+
+
+def find_gamedb():
+    p = HERE / GAMEDB_FILE[0]
+    return p if p.is_file() else None
+
+
+def load_gamedb(path):
+    """gameInfo.db (from the PSXPackager project): game ID -> title, title of the whole game, region."""
+    key = str(path)
+    if key not in _GAMEDB:
+        db = {}
+        try:
+            for line in Path(path).read_text("utf-8", "replace").splitlines():
+                p = line.split(";")
+                if len(p) >= 6:
+                    db[p[5].strip().upper()] = dict(main_id=p[1], main_title=p[2], title=p[3], region=p[4])
+        except OSError:
+            pass
+        _GAMEDB[key] = db
+    return _GAMEDB[key]
+
+
+def download_gamedb(dest_dir):
+    name, url, want = GAMEDB_FILE
+    tmp = Path(tempfile.mkdtemp(prefix="chdm_db_"))
+    try:
+        h, got = hashlib.sha256(), 0
+        with http_get(url, 60) as r, open(tmp / name, "wb") as f:
+            while True:
+                chunk = r.read(1 << 18)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                if got > 10 << 20:
+                    raise RuntimeError("the download is far larger than expected")
+        if h.hexdigest() != want:
+            raise RuntimeError("the checksum doesn't match, so the download was discarded")
+        os.replace(tmp / name, Path(dest_dir) / name)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def sfo_get(sfo, key):
+    """One text value of a PARAM.SFO ('' if missing)."""
+    if sfo[:4] != b"\0PSF":
+        return ""
+    kofs, dofs, n = struct.unpack("<III", sfo[8:20])
+    for i in range(n):
+        ko, fmt, ln, _mx, do = struct.unpack("<HHIII", sfo[20 + 16 * i:36 + 16 * i])
+        if sfo[kofs + ko:sfo.index(b"\0", kofs + ko)].decode("latin1") == key:
+            return sfo[dofs + do:dofs + do + ln].split(b"\0")[0].decode("utf-8", "replace")
+    return ""
+
+
+def pbp_game_id(path):
+    """DISC_ID of a PBP ('SLUS01545'), '' if it has none."""
+    try:
+        with open(path, "rb") as f:
+            o = struct.unpack("<10I", f.read(0x28))
+            f.seek(o[2])
+            return sfo_get(f.read(o[3] - o[2]), "DISC_ID").upper()
+    except (OSError, struct.error, ValueError):
+        return ""
+
+
+def target_label(key):
+    """Label of a target key, including the per-disc ones ('chd_d2' = CHD of disc 2 only)."""
+    base, _, d = key.partition("_d")
+    return TARGET_LABELS.get(base, "") + (f", disc {d} only" if d else "") if key not in TARGET_LABELS else TARGET_LABELS[key]
+
+
 # What a row's Action drop-down can offer. 'auto' is for CHDs that hold something else (hard disk, laserdisc, raw).
 TARGET_LABELS = {"chd": "→ CHD", "cue": "→ CUE/BIN", "cue_split": "→ CUE/BIN, one BIN per track",
                  "cue_single": "→ CUE/BIN, one single BIN", "iso": "→ ISO", "gdi": "→ GDI",
                  "pbp": "→ PlayStation PBP", "cdi": "→ DiscJuggler CDI (experimental)", "cso": "→ CSO (compressed ISO)",
-                 "verify": "Verify only", "recompress": "Recompress", "auto": "Extract"}
+                 "verify": "Verify only", "recompress": "Recompress", "auto": "Extract", "art": "→ Artwork images (PNG)"}
 # how the CHD extraction code names each target
 TARGET_FMT = {"cue": "auto", "cue_split": "split", "cue_single": "single", "iso": "iso", "gdi": "auto", "pbp": "pbp",
               "cdi": "cdi", "cso": "cso", "auto": "auto"}
@@ -1810,6 +2067,9 @@ class Job:
         self.src_files = []
         self.missing = []
         self.lone_bin = False
+        self.game_id, self.name_warned, self.disc_pick = "", False, None
+        self.archive, self.extract_dir = None, None   # set when the file was unpacked from an archive
+        self.wrap_cue = None           # a raw image without a CUE: the track type found in its first sector ('MODE2/2352')
         self.status = "Queued"
         self.result = ""
         self.out_path = None
@@ -1821,7 +2081,9 @@ class Job:
 
     def set_target(self, target):
         self.target = target
-        self.kind = {"chd": "convert", "verify": "verify", "recompress": "recompress"}.get(target, "extract")
+        base, _, d = target.partition("_d")
+        self.disc_pick = int(d) if d else None          # 'chd_d2': only disc 2 of a multi-disc PBP
+        self.kind = {"chd": "convert", "verify": "verify", "recompress": "recompress"}.get(base, "extract")
 
     def default_target(self):
         t = [k for k, _ in self.available_targets()]
@@ -1860,15 +2122,21 @@ class Job:
             keys.append("chd")
             if ty and self.container in ("pbp", "cdi", "image"):
                 keys.append("cue")
+            if self.container == "pbp":
+                keys.append("art")
             if ty and self.disc_count == 1:
                 if single:
-                    keys += [k for k, skip in (("iso", ".iso"), ("cso", ".cso")) if ext != skip]
+                    keys += [k for k, skip in (("iso", ".iso"), ("cso", ".cso")) if ext != skip or self.wrap_cue]
                 if raw and self.container != "cso":
                     if self.platform == "PS1" and ext != ".pbp":
                         keys.append("pbp")
                     if ext != ".cdi":
                         keys.append("cdi")
-        return [(k, TARGET_LABELS[k]) for k in dict.fromkeys(keys)]
+                elif ext in (".iso", ".cso") and self.platform == "PS1":
+                    keys.append("pbp")            # a plain PS1 ISO: raw sectors are rebuilt for the PBP
+        if self.container == "pbp" and self.disc_count > 1:
+            keys += [f"{b}_d{n}" for b in ("chd", "cue") for n in range(1, self.disc_count + 1)]
+        return [(k, target_label(k)) for k in dict.fromkeys(keys)]
 
     @property
     def can_pick(self):
@@ -1878,6 +2146,29 @@ class Job:
         self._analyze()
         if self.target not in [k for k, _ in self.available_targets()]:
             self.set_target(self.default_target())
+        self.game_id = self.guess_game_id()
+
+    def guess_game_id(self):
+        """The PlayStation game code ('SLUS01545') when it can be read straight from the file, else ''."""
+        ext = self.path.suffix.lower()
+        try:
+            if ext == ".pbp":
+                return pbp_game_id(self.path)
+            if self.platform != "PS1":
+                return ""
+            if ext == ".cue":
+                c = cue_data_start(self.path)
+                files = [c[0]] if c and c[0].exists() else []
+            else:
+                files = [self.path] if ext in (".iso", ".bin") else []
+            for f in files:
+                for stride, off in ((2352, 24), (2352, 16), (2048, 0)):
+                    gid = ps1_boot_id(f, off, stride)
+                    if gid:
+                        return gid
+        except (OSError, ValueError, struct.error):
+            pass
+        return ""
 
     def _analyze(self):
         p, ext = self.path, self.path.suffix.lower()
@@ -1890,6 +2181,7 @@ class Job:
         if ext == ".cso":
             total = read_cso_header(p)[0]
             self.size, self.src_files, self.container, self.types = p.stat().st_size, [p], "cso", ["MODE1"]
+            self.platform = cso_platform(p)
             self.auto_type, self.reason = decide_type(".iso", total, "")
             return
         if ext == ".m3u":
@@ -1949,8 +2241,13 @@ class Job:
         elif first:
             self.platform = sniff_platform(first)
         self.auto_type, self.reason = decide_type(ext, data_size, self.platform)
-        if ext == ".iso":
-            self.types = ["MODE1"]
+        if ext in (".iso", ".bin") and not self.missing:
+            self.wrap_cue = sniff_raw_image(p) or None
+            if self.wrap_cue:
+                self.types = [CUE_TYPE[self.wrap_cue]]
+                self.auto_type, self.reason = "CD", f"raw {self.wrap_cue.split('/')[0]} sectors without a CUE"
+            elif ext == ".iso":
+                self.types = ["MODE1"]
         elif ext == ".cue":
             ty = [CUE_TYPE.get(t) for _, t in parse_cue_tracks(p)]
             self.types = ty if ty and None not in ty else []
@@ -1960,7 +2257,7 @@ class Job:
             self.status = "Missing: " + ", ".join(self.missing[:2])
 
     def action_label(self):
-        text = self.action_text or TARGET_LABELS.get(self.target, "")
+        text = self.action_text or target_label(self.target or "")
         return text + "  ▾" if self.can_pick and not self.status.startswith("Done") else text
 
     def type_label(self):
@@ -1979,7 +2276,7 @@ DEFAULTS = {
     "exists": "Skip", "verify_after": True, "delete_src": False, "auto_cue": True,
     "extract_subfolder": False,
     "out_mode": "same", "out_dir": "", "keep_structure": True, "last_dir": "", "geometry": "",
-    "base_pbp": "", "base_pbp_ask": True, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
+    "base_pbp": "", "base_pbp_ask": True, "pbp_level": 6, "art_dir": "", "name_format": "%FILENAME%", "auto_log": False, "auto_update_check": True, "theme": "dark", "auto_suggest": True, "low_priority": False, "skip_version": "", "auto_app_check": True,
 }
 
 
@@ -1995,6 +2292,7 @@ class App:
         self.proc = None
         self.worker = None
         self.tree_ids = {}
+        self.arc_dirs = {}              # unpacked archive folder -> how many jobs still use it
         self.settings = dict(DEFAULTS)
         try:
             self.settings.update(json.loads(SETTINGS_FILE.read_text("utf-8")))
@@ -2287,6 +2585,21 @@ class App:
         ttk.Entry(bf, textvariable=v["base_pbp"], width=44).grid(row=1, column=0)
         ttk.Button(bf, text="Browse…", command=self.pick_base_pbp).grid(row=1, column=1, padx=4)
         ttk.Button(bf, text="Download…", command=self.download_base_pbp_ui).grid(row=1, column=2)
+        af = ttk.Frame(f)
+        af.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(af, text="Artwork folder for PBPs (optional; a subfolder per game with ICON0.PNG, PIC0.PNG, PIC1.PNG, SND0.AT3):").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(af, textvariable=v["art_dir"], width=52).grid(row=1, column=0)
+        ttk.Button(af, text="Browse…", command=self.pick_art_dir).grid(row=1, column=1, padx=4)
+        nf = ttk.Frame(f)
+        nf.grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(nf, text="Output file name (%FILENAME% %GAMEID% %TITLE% %REGION%):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(nf, textvariable=v["name_format"], width=34).grid(row=0, column=1, padx=6)
+        ttk.Button(nf, text="Get game titles…", command=self.download_gamedb_ui).grid(row=0, column=2)
+        pf = ttk.Frame(f)
+        pf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(pf, text="PBP compression (0 = none, 9 = smallest):").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(pf, textvariable=v["pbp_level"], width=4, state="readonly", values=list(range(10))).grid(row=0, column=1, padx=6)
 
         # --- Output
         f = tab("Output")
@@ -2303,6 +2616,8 @@ class App:
         ttk.Button(f, text="Browse…", command=self.pick_chdman).grid(row=3, column=2)
         ttk.Checkbutton(f, text="Check for a newer chdman at startup (only asks GitHub; never downloads by itself)",
                         variable=v["auto_update_check"]).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(f, text="Also write every run's log to chd_manager_log.txt next to the program",
+                        variable=v["auto_log"]).grid(row=5, column=0, columnspan=3, sticky="w")
 
         # --- About
         f = tab("About")
@@ -2643,7 +2958,7 @@ class App:
 
     def fmt_for(self, job, o=None):
         """How the CHD extraction code names this row's target."""
-        return TARGET_FMT.get(job.target, "auto")
+        return TARGET_FMT.get((job.target or "").partition("_d")[0], "auto")
 
     def action_choices(self, job):
         """[(label, target key)] offered in the Action drop-down of one row: only what can work for that item."""
@@ -2811,7 +3126,7 @@ class App:
     def action_text_for(self, job):
         if job.target == "chd" and job.disc_count > 1:
             return f"→ {job.disc_count} CHDs"
-        return TARGET_LABELS.get(job.target, "Extract")
+        return target_label(job.target or "") or "Extract"
 
     def update_action_labels(self):
         for j in self.jobs:
@@ -2823,7 +3138,7 @@ class App:
     def plan_text(self):
         c = {}
         for j in self.jobs:
-            lab = TARGET_LABELS.get(j.target, "")
+            lab = target_label(j.target or "")
             c[lab] = c.get(lab, 0) + 1
         return "  ·  ".join(f"{n} {lab}" for lab, n in c.items())
 
@@ -2912,6 +3227,7 @@ class App:
                 return
             self.stop()
         self.save_settings()
+        self.drop_all_arcs()
         self.root.destroy()
 
     def ask(self, msg):
@@ -2961,36 +3277,30 @@ class App:
         found = []   # (path, root)
         for p in map(Path, paths):
             if p.is_dir():
-                allf = [Path(dp) / fn for dp, _, fns in os.walk(p) for fn in fns]
-                referenced = set()
-                for f in allf:
-                    e = f.suffix.lower()
-                    refs = parse_cue(f) if e == ".cue" else parse_gdi(f) if e == ".gdi" else parse_toc(f) if e == ".toc" else []
-                    referenced.update(str(r).lower() for r in refs)
-                ignored = {}
-                for f in sorted(allf):
-                    e = f.suffix.lower()
-                    if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso", ".pbp", ".cdi", ".mds", ".nrg", ".ccd"):
-                        found.append((f, p))
-                    elif e == ".bin" and str(f).lower() not in referenced:
-                        found.append((f, p))
-                    elif e == ".img" and not f.with_suffix(".ccd").exists() and not f.with_suffix(".mds").exists():
-                        found.append((f, p))
-                    elif e == ".mdf" and not f.with_suffix(".mds").exists():
-                        ignored[e] = ignored.get(e, 0) + 1
-                    elif e in UNSUPPORTED_EXTS:
-                        ignored[e] = ignored.get(e, 0) + 1
+                files, ignored = self.scan_folder(p)
+                found += [(f, p) for f in files]
                 if ignored:
-                    self.log(f"Ignored {sum(ignored.values())} file(s) chdman can't read directly ({', '.join(sorted(ignored))}). "
-                             "Unpack archives first, and keep an .mdf next to its .mds.", "warn")
+                    self.log(f"Ignored {sum(ignored.values())} file(s) ({', '.join(sorted(ignored))}): keep an .mdf next to its .mds.", "warn")
+            elif p.suffix.lower() in ARCHIVE_EXTS:
+                found.append((p, None))
             elif p.suffix.lower() in SRC_EXTS | {".chd"}:
                 found.append((image_primary(p), None))
             else:
                 self.log(f"Skipped (unsupported type): {p.name}", "warn")
+        jobs_from = []   # (file, root, archive, folder it was unpacked into)
+        known = {str(j.archive).lower() for j in self.jobs if j.archive}
+        for f, root in found:
+            if f.suffix.lower() in ARCHIVE_EXTS:
+                if str(f).lower() in known:
+                    continue
+                files, tmp = self.open_archive(f)
+                jobs_from += [(x, None, f, tmp) for x in files]
+            else:
+                jobs_from.append((f, root, None, None))
         have = {str(j.path).lower() for j in self.jobs}
         was_empty = not self.jobs
         added = 0
-        for f, root in found:
+        for f, root, arc, tmp in jobs_from:
             if str(f).lower() in have:
                 continue
             try:
@@ -2999,6 +3309,9 @@ class App:
             except Exception as e:  # noqa: BLE001
                 self.log(f"Could not read {f.name}: {e}", "err")
                 continue
+            if arc:
+                job.archive, job.extract_dir, job.home, job.src_files = arc, tmp, arc.parent / f.name, [arc]
+                self.arc_dirs[tmp] += 1
             have.add(str(f).lower())
             self.jobs.append(job)
             iid = self.tree.insert("", "end", values=job.row(), tags=("odd" if len(self.tree_ids) % 2 else "even",))
@@ -3031,6 +3344,7 @@ class App:
             job = self.tree_ids.pop(iid, None)
             if job in self.jobs:
                 self.jobs.remove(job)
+                self.drop_arc(job)
             self.tree.delete(iid)
         self.restripe()
         self.refresh_empty()
@@ -3045,6 +3359,7 @@ class App:
         self.tree.delete(*self.tree.get_children())
         self.tree_ids.clear()
         self.jobs.clear()
+        self.drop_all_arcs()
         self.refresh_empty()
         self.update_status_idle()
         self.refresh_suggestions()
@@ -3118,6 +3433,10 @@ class App:
         except (ValueError, tk.TclError):
             o["threads"] = 0
         o["base_pbp_file"] = str(find_base_pbp(o.get("base_pbp", "")) or "")
+        try:
+            o["pbp_level"] = min(9, max(0, int(o["pbp_level"])))
+        except (ValueError, tk.TclError):
+            o["pbp_level"] = 6
         return o
 
     BASE_PBP_TEXT = ("A PBP needs a small loader program from Sony to run on a real PSP or Vita. CHD Manager doesn't include it, "
@@ -3159,6 +3478,129 @@ class App:
         self.update_status_idle()
         return True
 
+    # ---- archives: unpacked into a hidden folder when added, and removed again when the file is done with
+    def scan_folder(self, p, archives=True):
+        """The disc files in a folder tree -> ([paths], {ignored extension: count})."""
+        found, ignored = [], {}
+        allf = [Path(dp) / fn for dp, _, fns in os.walk(p) for fn in fns]
+        referenced = set()
+        for f in allf:
+            e = f.suffix.lower()
+            refs = parse_cue(f) if e == ".cue" else parse_gdi(f) if e == ".gdi" else parse_toc(f) if e == ".toc" else []
+            referenced.update(str(r).lower() for r in refs)
+        for f in sorted(allf):
+            e = f.suffix.lower()
+            if e == ".chd" or e in (".cue", ".gdi", ".toc", ".iso", ".pbp", ".cdi", ".mds", ".nrg", ".ccd", ".cso"):
+                found.append(f)
+            elif e == ".bin" and str(f).lower() not in referenced:
+                found.append(f)
+            elif e == ".img" and not f.with_suffix(".ccd").exists() and not f.with_suffix(".mds").exists():
+                found.append(f)
+            elif e == ".mdf" and not f.with_suffix(".mds").exists():
+                ignored[e] = ignored.get(e, 0) + 1
+            elif e in ARCHIVE_EXTS and archives:
+                found.append(f)
+        return found, ignored
+
+    def pumped(self, fn):
+        """Run fn in a thread while the window keeps answering; returns the exception it raised, or None."""
+        box = {}
+
+        def work():
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                box["err"] = e
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        while t.is_alive():
+            self.root.update()
+            time.sleep(0.03)
+        return box.get("err")
+
+    def open_archive(self, arc):
+        """Unpack an archive next to itself in a hidden folder -> ([the disc files inside], that folder or None)."""
+        import gzip
+        import tarfile
+        import zipfile
+        name, ext = arc.name.lower(), arc.suffix.lower()
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix=".chdm_arc_", dir=str(arc.parent)))
+        except OSError:
+            tmp = Path(tempfile.mkdtemp(prefix="chdm_arc_"))
+        self.status.config(text=f"Unpacking {arc.name}…")
+        self.root.update_idletasks()
+
+        def run():
+            if ext == ".zip":
+                with zipfile.ZipFile(arc) as z:
+                    z.extractall(tmp)
+            elif ext in (".tar", ".tgz") or name.endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+                with tarfile.open(arc) as t:
+                    t.extractall(tmp, filter="data")
+            elif ext == ".gz":
+                with gzip.open(arc) as src, open(tmp / arc.stem, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+            else:
+                z = find_7z()
+                if not z:
+                    raise RuntimeError("7-Zip is needed for this kind of archive (Settings, Output page, or install it from 7-zip.org)")
+                r = subprocess.run([z, "x", "-y", f"-o{tmp}", str(arc), "-bso0", "-bsp0"], capture_output=True,
+                                   creationflags=CREATE_NO_WINDOW)
+                if r.returncode:
+                    raise RuntimeError((r.stderr or r.stdout).decode("utf-8", "replace").strip()[-300:] or f"7-Zip exited with {r.returncode}")
+        if ext in (".7z", ".rar") and not find_7z() and not self.silent and not self.ensure_7zip():
+            shutil.rmtree(tmp, ignore_errors=True)
+            return [], None
+        err = self.pumped(run)
+        if err:
+            self.log(f"Could not unpack {arc.name}: {err}", "err")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return [], None
+        files, _ = self.scan_folder(tmp, archives=False)
+        if not files:
+            self.log(f"{arc.name}: no disc images found inside.", "warn")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return [], None
+        self.arc_dirs[tmp] = 0
+        return files, tmp
+
+    def drop_arc(self, job):
+        """A job that came out of an archive is finished with: delete the unpacked folder once no other job uses it."""
+        d = getattr(job, "extract_dir", None)
+        if d is None or d not in self.arc_dirs:
+            return
+        job.extract_dir = None
+        self.arc_dirs[d] -= 1
+        if self.arc_dirs[d] <= 0:
+            del self.arc_dirs[d]
+            shutil.rmtree(d, ignore_errors=True)
+
+    def drop_all_arcs(self):
+        for d in list(self.arc_dirs):
+            shutil.rmtree(d, ignore_errors=True)
+        self.arc_dirs.clear()
+
+    def download_gamedb_ui(self):
+        if self.silent or not messagebox.askyesno(APP_NAME, "To name files after the game's title, region or disc code, CHD Manager "
+                "needs a list of PlayStation game codes and titles: gameInfo.db (about 1 MB) from the public PSXPackager project on "
+                "GitHub (MIT license). It is checked against a fixed checksum and kept next to CHD Manager.\n\nDownload it now?"):
+            return
+        self.status.config(text="Downloading the game list…")
+        self.root.update_idletasks()
+        try:
+            download_gamedb(HERE)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"Could not get the game list: {e}")
+        else:
+            self.log(f"Saved gameInfo.db next to the program ({HERE}).", "ok")
+        self.update_status_idle()
+
+    def pick_art_dir(self):
+        d = filedialog.askdirectory(title="Folder with one subfolder of artwork per game")
+        if d:
+            self.v["art_dir"].set(d)
+
     def pick_base_pbp(self):
         p = filedialog.askopenfilename(title="Choose a working PlayStation 1 .pbp",
                                        filetypes=[("PBP files", "*.pbp"), ("All files", "*.*")])
@@ -3188,6 +3630,7 @@ class App:
             j.status, j.result = "Queued", ""
             self.refresh_job(j)
         self.save_settings()
+        self.log_mark = self.logbox.index("end-1c")
         self.running, self.stop_flag = True, False
         self.set_state("run")
         self.start_btn.config(state="disabled")
@@ -3265,8 +3708,30 @@ class App:
             msg += f"  Converted {fmt_size(stats['src'])} → {fmt_size(stats['out'])}, saved {fmt_size(saved)} ({100 * saved / stats['src']:.0f}%)."
         self.post("finish", msg, stats["fail"] == 0)
 
-    def output_path(self, job, o, ext, multi=False):
+    def out_stem(self, job, o):
+        """The output file's name: the source's, or built from the game ID and title when Settings, Formats says so."""
+        fmt = (o.get("name_format") or "%FILENAME%").strip()
         stem = job.home.stem
+        if fmt == "%FILENAME%":
+            return stem
+        gid = job.game_id
+        dbf = find_gamedb()
+        ent = load_gamedb(dbf).get(gid) if gid and dbf else None
+        vals = {"%FILENAME%": stem, "%GAMEID%": gid, "%TITLE%": ent["title"] if ent else "",
+                "%MAINTITLE%": ent["main_title"] if ent else "", "%MAINGAMEID%": ent["main_id"] if ent else "",
+                "%REGION%": ent["region"] if ent else ""}
+        if any(k in fmt and not v for k, v in vals.items()):
+            if not job.name_warned:
+                job.name_warned = True
+                why = "no game ID could be read from it" if not gid else "gameInfo.db has no entry for it (Settings, Formats, Get game titles)"
+                self.post("log", f"{job.path.name}: kept the original file name, since {why}.", "warn")
+            return stem
+        for k, v in vals.items():
+            fmt = fmt.replace(k, v)
+        return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", fmt).strip(" .") or stem
+
+    def output_path(self, job, o, ext, multi=False):
+        stem = self.out_stem(job, o)
         if o["out_mode"] == "custom" and o["out_dir"]:
             base = Path(o["out_dir"])
             if o["keep_structure"] and job.root:
@@ -3339,7 +3804,8 @@ class App:
 
     def do_unpack(self, job, o):
         """.pbp / .cdi / .mds / .nrg / .ccd / .img -> CUE/BIN files in their own folder, no CHD."""
-        stem, n = job.path.stem, job.disc_count
+        n = job.disc_count
+        stem = self.output_path(job, o, ".cue").stem
         out = self.output_path(job, o, ".cue").parent / stem
         if out.exists() and any(out.iterdir()):
             if o["exists"] == "Skip":
@@ -3356,7 +3822,7 @@ class App:
         bases = pbp_discs(job.path) if job.container == "pbp" else [None]
         cues = []
         try:
-            for i in range(n):
+            for i in ([job.disc_pick - 1] if job.disc_pick else range(n)):
                 label = f" disc {i + 1} of {n}" if n > 1 else ""
                 last = [-1]
 
@@ -3391,14 +3857,16 @@ class App:
     def do_convert_container(self, job, o):
         """.pbp / .cdi -> unpack to CUE/BIN in a temporary folder, then chdman createcd. A multi-disc PBP
         becomes one CHD per disc plus an .m3u playlist."""
-        stem, n = job.path.stem, job.disc_count
+        n = job.disc_count
         first = self.output_path(job, o, ".chd")
-        outs = [first] if n == 1 else [first.with_name(f"{stem} (Disc {i}).chd") for i in range(1, n + 1)]
+        stem = first.stem
+        discs = [job.disc_pick - 1] if job.disc_pick else list(range(n))
+        outs = [first] if n == 1 else [first.with_name(f"{stem} (Disc {i + 1}).chd") for i in discs]
         tmp = first.parent / f".{stem[:40]}.chdm_tmp"
         made, skipped, unverified = [], 0, False
         try:
             bases = pbp_discs(job.path) if job.container == "pbp" else [None]
-            for i, out in enumerate(outs):
+            for i, out in zip(discs, outs):
                 label = f" disc {i + 1} of {n}" if n > 1 else ""
                 out, force, skip = self.handle_exists(job, out, o)
                 if skip:
@@ -3459,7 +3927,7 @@ class App:
             shutil.rmtree(tmp, ignore_errors=True)
         if not made:
             return                                  # everything was skipped; handle_exists already said why
-        if n > 1 and len(made) == n:
+        if n > 1 and len(made) == n and not job.disc_pick:
             first.with_name(stem + ".m3u").write_text("".join(p.name + "\n" for p in made), "utf-8")
         job.out_size = sum(p.stat().st_size for p in made)
         job.status = "Done"
@@ -3484,15 +3952,17 @@ class App:
             return
         typ = job.type
         src, temp_cue = job.path, None
-        if job.lone_bin:
-            if not o["auto_cue"]:
+        if job.lone_bin or job.wrap_cue:
+            if not job.wrap_cue and not o["auto_cue"]:
                 job.status = "No CUE"
                 self.post("log", f"{job.path.name}: .bin without a CUE (enable auto-create in Settings, Convert page).", "err")
                 return
+            mode = job.wrap_cue or "MODE2/2352"
             temp_cue = job.path.with_name(job.path.stem + ".__chdm_auto__.cue")
-            temp_cue.write_text(f'FILE "{job.path.name}" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n', "utf-8")
+            temp_cue.write_text(f'FILE "{job.path.name}" BINARY\n  TRACK 01 {mode}\n    INDEX 01 00:00:00\n', "utf-8")
             src = temp_cue
-            self.post("log", f"{job.path.name}: created a temporary CUE (MODE2/2352).", "warn")
+            typ = "CD"
+            self.post("log", f"{job.path.name}: created a temporary CUE ({mode}).", "warn" if job.lone_bin and not job.wrap_cue else "info")
         try:
             out = self.output_path(job, o, ".chd")
             out, force, skip = self.handle_exists(job, out, o)
@@ -3628,10 +4098,12 @@ class App:
     def export_other(self, job, o):
         """A disc image / PBP / CDI / CSO whose target isn't a CHD. Where a direct route exists it is used; every other
         combination goes through a temporary uncompressed CHD, so each target is written by the same code whatever the source."""
-        t = job.target
+        t = (job.target or "").partition("_d")[0]
+        if t == "art":
+            return self.do_extract_art(job, o)
         if t == "cue" and job.container in ("pbp", "cdi", "image"):
             return self.do_unpack(job, o)
-        if t == "cso" and job.path.suffix.lower() == ".iso":
+        if t == "cso" and job.path.suffix.lower() == ".iso" and not job.wrap_cue:
             return self.do_iso_to_cso(job, o)
         if t == "iso" and job.container == "cso":
             return self.do_cso_to_iso(job, o)
@@ -3689,9 +4161,43 @@ class App:
                 self.post("log", f"{job.path.name}: {e}", "err")
                 return False
             typ = "DVD" if src.suffix.lower() == ".iso" else "CD"
+        temp_cue = None
+        if job.wrap_cue:
+            src = temp_cue = job.path.with_name(job.path.stem + ".__chdm_auto__.cue")
+            temp_cue.write_text(f'FILE "{job.path.name}" BINARY\n  TRACK 01 {job.wrap_cue}\n    INDEX 01 00:00:00\n', "utf-8")
+            typ = "CD"
+        elif job.target == "pbp" and src.suffix.lower() == ".iso":
+            last = [-1]
+
+            def cprog(x):
+                pct = int(100 * x)
+                if pct != last[0]:
+                    last[0] = pct
+                    job.status = f"Rebuilding sectors {pct}%"
+                    self.post("job", job)
+                    self.post("progress", pct)
+
+            self.post("log", f"{job.path.name}: rebuilding raw CD sectors from the plain ISO (a PBP needs them).", "info")
+            raw = tmp / "raw.bin"
+            try:
+                cook_to_raw(src, raw, cprog, lambda: self.stop_flag)
+            except UnpackError:
+                job.status = "Stopped"
+                return False
+            except OSError as e:
+                job.status, job.result = "Failed (disk)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+                return False
+            src = tmp / "raw.cue"
+            src.write_text('FILE "raw.bin" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n', "utf-8")
+            typ = "CD"
         cmd = [CHDMAN, "createdvd" if typ == "DVD" and self.has_dvd else "createcd", "-i", str(src), "-o", str(tchd), "-c", "none"]
         self.post("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), "cmd")
-        rc = self.run_proc(cmd, job, "Preparing")
+        try:
+            rc = self.run_proc(cmd, job, "Preparing")
+        finally:
+            if temp_cue:
+                temp_cue.unlink(missing_ok=True)
         if self.stop_flag or rc != 0:
             job.status = "Stopped" if self.stop_flag else f"Failed (code {rc})"
             return False
@@ -3799,6 +4305,40 @@ class App:
             shutil.rmtree(tmp, ignore_errors=True)
             out.with_name(out.name + ".part").unlink(missing_ok=True)
 
+    # ---- artwork for PBPs
+    def find_art(self, o, stem, game_id, title):
+        """Your artwork for this game, if the artwork folder (Settings, Formats) has a subfolder named after the output file,
+        the game ID or the title. Returns a dict for write_pbp, or None."""
+        root = o.get("art_dir")
+        if not root or not Path(root).is_dir():
+            return None
+        for name in dict.fromkeys(n for n in (stem, game_id, title) if n):
+            art, warn = read_art_folder(Path(root) / name)
+            if art:
+                self.post("log", f"Using your artwork from {Path(root) / name}: {', '.join(k.upper() for k in art)}.", "info")
+                for w in warn:
+                    self.post("log", f"Artwork: {w}.", "warn")
+                return art
+        return None
+
+    def do_extract_art(self, job, o):
+        """PBP -> its icon, pictures and sound as files (into the artwork folder when one is set, so they are picked up again)."""
+        root = o.get("art_dir")
+        out = Path(root) / job.home.stem if root and Path(root).is_dir() else self.output_path(job, o, ".x").parent / f"{job.home.stem} (artwork)"
+        try:
+            made = extract_pbp_art(job.path, out)
+        except (UnpackError, OSError) as e:
+            job.status, job.result = "Failed (can't read)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+            return
+        if not made:
+            job.status, job.result = "Nothing to extract", "this PBP has no icon, pictures or sound"
+            self.post("log", f"{job.path.name}: {job.result}", "warn")
+            return
+        job.out_path = out
+        job.status, job.result = "Done", f"→ {out.name}\\ ({', '.join(made)})"
+        self.post("log", f"OK  {out}: {', '.join(made)}", "ok")
+
     def extract_to_pbp(self, job, o):
         """CD CHD (or an .m3u playlist of CHDs, one per disc) -> one .pbp. PlayStation 1 discs only."""
         is_m3u = job.path.suffix.lower() == ".m3u"
@@ -3850,6 +4390,15 @@ class App:
                     return fail("Failed (not PS1)", f"{chd.name} doesn't look like a PlayStation 1 game, so it can't go in a PBP.")
                 layouts.append(lay)
                 ids.append(gid)
+            if o["name_format"].strip() != "%FILENAME%":
+                job.game_id = ids[0]                    # the code read from the disc names the file
+                new = self.output_path(job, o, ".pbp")
+                if new != out:
+                    out, force, skip = self.handle_exists(job, new, o)
+                    if skip:
+                        return
+                    part = out.with_name(out.name + ".part")
+                    job.out_path = out
             donor = None
             if o.get("base_pbp_file"):
                 try:
@@ -3862,7 +4411,8 @@ class App:
             title = re.sub(r"\s*\((?:disc|cd)\s*\d+\)", "", out.stem, flags=re.I)
             title = re.sub(r"\s*\[[^\]]*\]", "", title).strip() or out.stem
             try:
-                write_pbp(part, layouts, ids, title, lambda x: prog("Writing PBP", x), lambda: self.stop_flag, donor=donor)
+                write_pbp(part, layouts, ids, title, lambda x: prog("Writing PBP", x), lambda: self.stop_flag, donor=donor,
+                          level=o["pbp_level"], art=self.find_art(o, out.stem, ids[0], title))
                 if o["verify_after"]:
                     if not verify_pbp(part, layouts, lambda x: prog("Verifying", x), lambda: self.stop_flag):
                         return fail("Verify failed", "the finished PBP didn't match the disc it was made from; it was discarded.")
@@ -4524,6 +5074,16 @@ class App:
                     self.on_app_update_done(ev[1], ev[2])
                 elif kind == "finish":
                     self.running = False
+                    if self.v["auto_log"].get():
+                        try:
+                            with open(HERE / "chd_manager_log.txt", "a", encoding="utf-8") as lf:
+                                lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+                                         + self.logbox.get(getattr(self, "log_mark", "1.0"), "end-1c") + "\n")
+                        except (OSError, tk.TclError):
+                            pass
+                    for j in self.jobs:
+                        if j.status.startswith("Done"):
+                            self.drop_arc(j)
                     self.root.after_idle(self.autofit_columns)
                     self.start_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
