@@ -1678,6 +1678,8 @@ class Job:
         self.root = Path(root) if root else None
         self.kind = "convert"          # convert | extract | verify | recompress
         self.task_override = None      # per-item choice for a CHD: "Extract" | "Verify" | "Recompress"
+        self.fmt = None                # per-item output format for a CHD (a FORMAT_LABELS key); None = the Settings default
+        self.can_pick = False          # the Action cell offers a drop-down of choices
         self.action_text = ""
         self.override = "Auto"         # Auto | CD | DVD
         self.auto_type, self.reason = "CD", ""
@@ -1707,6 +1709,7 @@ class Job:
             self.size = p.stat().st_size
             self.disc, self.tracks = chd_info(p) if CHDMAN else ("?", 0)
             self.src_files = [p]
+            self.can_pick = True
             return
         if ext == ".m3u":
             lines = [ln.strip() for ln in p.read_text("utf-8-sig", "replace").splitlines() if ln.strip() and not ln.startswith("#")]
@@ -1721,6 +1724,7 @@ class Job:
         if ext in IMAGE_EXTS:
             tracks = read_image(p)
             self.container = "image"
+            self.can_pick = True
             self.src_files = image_sources(p, tracks)
             self.size = sum(f.stat().st_size for f in self.src_files)
             self.platform = image_platform(tracks)
@@ -1728,6 +1732,7 @@ class Job:
             return
         if ext in (".pbp", ".cdi"):
             self.container = ext[1:]
+            self.can_pick = True
             self.size = p.stat().st_size
             self.src_files = [p]
             if ext == ".pbp":
@@ -1765,7 +1770,9 @@ class Job:
             self.status = "Missing: " + ", ".join(self.missing[:2])
 
     def action_label(self):
-        return self.action_text or {"convert": "→ CHD", "extract": "Extract", "verify": "Verify", "recompress": "Recompress"}[self.kind]
+        text = self.action_text or {"convert": "→ CHD", "extract": "Extract", "verify": "Verify", "recompress": "Recompress",
+                                    "unpack": "→ CUE/BIN"}[self.kind]
+        return text + "  ▾" if self.can_pick and not self.status.startswith("Done") else text
 
     def type_label(self):
         if self.kind == "convert":
@@ -1960,7 +1967,14 @@ class App:
                                     ".cue / .gdi / .iso / .toc  →  CHD (CD or DVD chosen for you)\n"
                                     ".chd  →  extract or verify")
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
-        self.tree.bind("<Double-1>", lambda e: self.info_selected())
+        self.picker, self.manual_cols, self.auto_w, self.tip, self.tip_after, self.tip_cell = None, set(), {}, None, None, None
+        self.tree.bind("<Double-1>", self.on_tree_double)
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press, add="+")
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_release, add="+")
+        self.tree.bind("<MouseWheel>", lambda e: self.close_picker(), add="+")
+        self.tree.bind("<Motion>", self.on_tree_motion)
+        self.tree.bind("<Leave>", lambda e: self.hide_tip())
+        self.tree.bind("<Configure>", lambda e: self.root.after_idle(self.autofit_columns), add="+")
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<Button-3>", self.on_right_click)
         root.bind("<Control-o>", lambda e: self.add_files_dialog())
@@ -2185,7 +2199,8 @@ class App:
         st.configure("Treeview", background=t["panel"], fieldbackground=t["panel"], foreground=t["fg"], rowheight=31,
                      borderwidth=0, relief="flat")
         st.map("Treeview", background=[("selected", t["sel"])], foreground=[("selected", t["fg"])])
-        st.configure("Treeview.Heading", background=t["head"], foreground=t["muted"], relief="flat", borderwidth=0,
+        st.configure("Treeview.Heading", background=t["head"], foreground=t["muted"], relief="groove", borderwidth=1,
+                     bordercolor=t["border"], lightcolor=t["border"], darkcolor=t["border"],
                      font=("Segoe UI Semibold", 9), padding=(10, 8))
         st.map("Treeview.Heading", background=[("active", t["btn_hover"])])
         st.configure("TNotebook", background=t["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
@@ -2479,9 +2494,163 @@ class App:
         self.sync_fmt_disp()
         self.root.after(50, self.fit_toolbar)
 
+    def fmt_for(self, job, o=None):
+        """The output format for a CHD: this row's own choice, else the one in Settings."""
+        if job.path.suffix.lower() == ".m3u":
+            return "pbp"                      # a playlist can only become a PBP
+        return job.fmt or ((o or {}).get("extract_format") if o else self.v["extract_format"].get())
+
+    def action_choices(self, job):
+        """[(label, task, fmt)] offered in the Action drop-down of one row. Only things that can work for this item."""
+        if job.path.suffix.lower() == ".chd":
+            ex = {"CD": [("→ CUE/BIN (automatic)", "auto"), ("→ CUE/BIN, one BIN per track", "split"),
+                         ("→ CUE/BIN, one single BIN", "single"), ("→ ISO (data discs)", "iso"),
+                         ("→ PlayStation PBP (PS1 discs)", "pbp"), ("→ DiscJuggler CDI (experimental)", "cdi")],
+                  "GD-ROM": [("→ GDI", "auto")], "DVD": [("→ ISO", "auto")]}.get(job.disc, [("Extract", "auto")])
+            return ([("Default (from Settings)", None, None)] + [(lab, "Extract", f) for lab, f in ex]
+                    + [("Verify only", "Verify", None), ("Recompress", "Recompress", None)])
+        if job.container:
+            return [("→ CHD", "convert", None), ("→ CUE/BIN files only (no CHD)", "unpack", None)]
+        return []
+
+    def pick_action(self, job, choice):
+        _, task, fmt = choice
+        if job.path.suffix.lower() == ".chd":
+            job.task_override, job.fmt = task, fmt
+            job.kind = KIND[task] if task else KIND.get(self.v["chd_action"].get(), "extract")
+        else:
+            job.kind = task
+        self.close_picker()
+        self.update_action_labels()
+        self.update_status_idle()
+
+    def close_picker(self):
+        pk = getattr(self, "picker", None)
+        self.picker = None
+        if pk is not None:
+            try:
+                pk.destroy()
+            except tk.TclError:
+                pass
+
+    # ---- column widths: sized to their text, until the user drags a divider (double-click a divider to fit it again)
+    def tree_font(self):
+        from tkinter import font as tkfont
+        if getattr(self, "_tf", None) is None:
+            self._tf = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or "TkDefaultFont")
+        return self._tf
+
+    def autofit_columns(self, only=None):
+        cols = self.tree["displaycolumns"]
+        avail = self.tree.winfo_width()
+        if avail < 200 or self.running and only is None:
+            return
+        f, pad = self.tree_font(), 26
+        caps = {"file": 520, "result": 520, "status": 260, "action": 330, "platform": 140, "type": 120, "size": 110}
+        floor = {"file": 150, "result": 120, "status": 110, "action": 110, "platform": 80, "type": 70, "size": 70}
+        want = {}
+        for c in cols:
+            texts = [self.tree.heading(c, "text")] + [self.tree.set(i, c) for i in self.tree.get_children()]
+            want[c] = min(caps[c], max(f.measure(t) for t in texts) + pad)
+        free = [c for c in ("file", "result") if c not in self.manual_cols]
+        over = sum(want[c] if c not in self.manual_cols else self.tree.column(c, "width") for c in cols) - avail
+        for c in sorted(free, key=lambda c: -want[c]):        # too wide for the window: trim the two long columns first
+            if over > 0:
+                cut = min(over, want[c] - floor[c])
+                want[c] -= cut
+                over -= cut
+        for c in cols:
+            if c in self.manual_cols and only != c:
+                continue
+            self.manual_cols.discard(c)
+            self.auto_w[c] = want[c]
+            self.tree.column(c, width=want[c])
+
+    def on_tree_press(self, e):
+        self.close_picker()
+        self.sep_drag = self.tree.identify_region(e.x, e.y) == "separator"
+        self.press_w = {c: self.tree.column(c, "width") for c in self.tree["displaycolumns"]}
+
+    def on_tree_double(self, e):
+        region = self.tree.identify_region(e.x, e.y)
+        if region == "separator":
+            col = self.tree.identify_column(e.x)
+            self.manual_cols.discard(self.tree["displaycolumns"][int(col[1:]) - 1])
+            self.autofit_columns(only=self.tree["displaycolumns"][int(col[1:]) - 1])
+        elif not (region == "cell" and self.tree.identify_column(e.x) == "#2"):
+            self.info_selected()
+
+    def note_manual_resize(self):
+        """After a divider drag, remember which columns the user sized themselves."""
+        for c in self.tree["displaycolumns"]:
+            if self.tree.column(c, "width") != self.press_w.get(c):
+                self.manual_cols.add(c)
+
+    def hide_tip(self):
+        if self.tip_after:
+            self.root.after_cancel(self.tip_after)
+            self.tip_after = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+        self.tip_cell = None
+
+    def on_tree_motion(self, e):
+        cell = (self.tree.identify_row(e.y), self.tree.identify_column(e.x)) if self.tree.identify_region(e.x, e.y) == "cell" else None
+        if cell == self.tip_cell:
+            return
+        self.hide_tip()
+        self.tip_cell = cell
+        if cell and cell[0]:
+            self.tip_after = self.root.after(500, lambda: self.show_tip(cell, e.x_root, e.y_root))
+
+    def show_tip(self, cell, x, y):
+        iid, col = cell
+        name = self.tree["displaycolumns"][int(col[1:]) - 1]
+        text = self.tree.set(iid, name)
+        if not text or self.tree_font().measure(text) + 14 <= self.tree.column(name, "width"):
+            return
+        if name == "file":
+            job = self.tree_ids.get(iid)
+            text = str(job.path) if job else text
+        self.tip = tk.Toplevel(self.root)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x + 14}+{y + 18}")
+        tk.Label(self.tip, text=text, bg=self.t["field"], fg=self.t["fg"], relief="solid", borderwidth=1, padx=6, pady=3,
+                 wraplength=700, justify="left", font=("Segoe UI", 9)).pack()
+
+    def on_tree_release(self, e):
+        if getattr(self, "sep_drag", False):
+            self.sep_drag = False
+            self.note_manual_resize()
+            return
+        """A click on a row's Action cell opens a drop-down with every choice that fits that item."""
+        if self.running or self.tree.identify_region(e.x, e.y) != "cell" or self.tree.identify_column(e.x) != "#2" or e.state & 0x5:
+            return
+        iid = self.tree.identify_row(e.y)
+        job = self.tree_ids.get(iid)
+        if job is None or not job.can_pick or job.status.startswith("Done"):
+            return
+        box = self.tree.bbox(iid, "action")
+        if not box:
+            return
+        self.close_picker()
+        choices = self.action_choices(job)
+        cb = ttk.Combobox(self.tree, state="readonly", values=[c[0] for c in choices])
+        cb.place(x=box[0], y=box[1], width=max(box[2], 290), height=box[3])
+        cb.bind("<<ComboboxSelected>>", lambda ev: self.pick_action(job, choices[cb.current()]))
+        cb.set(job.action_label().replace("  ▾", ""))
+        cb.bind("<Escape>", lambda ev: self.close_picker())
+        self.picker = cb
+        cb.focus_set()
+        try:
+            cb.tk.call("ttk::combobox::Post", str(cb))
+        except tk.TclError:
+            pass
+
     def wants_split(self, job, o=None):
         """One BIN per track: forced by the user, or automatically when a CD has more than one track."""
-        fmt = (o or {}).get("extract_format") if o else self.v["extract_format"].get()
+        fmt = self.fmt_for(job, o)
         split_opt = (o or {}).get("split_bin") if o else self.v["split_bin"].get()
         if fmt == "single":
             return False
@@ -2490,11 +2659,13 @@ class App:
     def action_text_for(self, job):
         if job.kind == "convert":
             return f"→ {job.disc_count} CHDs" if job.disc_count > 1 else "→ CHD"
+        if job.kind == "unpack":
+            return "→ CUE/BIN"
         if job.kind == "verify":
             return "Verify"
         if job.kind == "recompress":
             return "Recompress"
-        fmt = self.v["extract_format"].get()
+        fmt = self.fmt_for(job)
         if job.path.suffix.lower() == ".m3u" or (fmt == "pbp" and job.disc == "CD"):
             return "→ PBP"
         if fmt == "cdi" and job.disc == "CD":
@@ -2512,12 +2683,15 @@ class App:
             j.action_text = self.action_text_for(j)
             self.refresh_job(j)
         self.refresh_chd_controls()
+        self.root.after_idle(self.autofit_columns)
 
     def plan_text(self):
         c = collections_counter(self.jobs)
         parts = []
         if c.get("convert"):
             parts.append(f"{c['convert']} disc image(s) → CHD")
+        if c.get("unpack"):
+            parts.append(f"{c['unpack']} disc image(s) → CUE/BIN")
         if c.get("extract"):
             parts.append(f"{c['extract']} CHD file(s) → extract")
         if c.get("verify"):
@@ -2747,6 +2921,7 @@ class App:
         self.update_status_idle()
         self.refresh_suggestions()
         self.refresh_chd_controls()
+        self.root.after_idle(self.autofit_columns)
 
     def clear_all(self):
         if self.running:
@@ -2844,8 +3019,8 @@ class App:
                      "You can also choose any working PlayStation 1 .pbp of your own in Settings, CHD files.")
 
     def pbp_jobs(self, todo):
-        fmt = self.v["extract_format"].get()
-        return any(j.kind == "extract" and (j.path.suffix.lower() == ".m3u" or (fmt == "pbp" and j.disc == "CD")) for j in todo)
+        return any(j.kind == "extract" and (j.path.suffix.lower() == ".m3u" or (self.fmt_for(j) == "pbp" and j.disc == "CD"))
+                   for j in todo)
 
     def offer_base_pbp(self):
         """Before making PBPs without a base: offer the download once. False = don't start."""
@@ -2955,7 +3130,7 @@ class App:
             started = time.time()
             try:
                 {"convert": self.do_convert, "extract": self.do_extract, "verify": self.do_verify,
-                 "recompress": self.do_recompress}[job.kind](job, o)
+                 "recompress": self.do_recompress, "unpack": self.do_unpack}[job.kind](job, o)
             except Exception:  # noqa: BLE001
                 job.status = "Error"
                 self.post("log", traceback.format_exc(), "err")
@@ -3042,6 +3217,66 @@ class App:
             a += ["-np", str(o["threads"])]
         return a
 
+    def unpack_job(self, job, base, outdir, tag, prog, iso_ok=False):
+        """One disc of a .pbp / .cdi / disc image -> CUE/BIN files in outdir. Returns the .cue (or .iso) path."""
+        stopped = lambda: self.stop_flag  # noqa: E731
+        if job.container == "pbp":
+            return unpack_pbp_disc(job.path, base, outdir, tag, prog, stopped)
+        if job.container == "image":
+            return unpack_tracks(read_image(job.path), outdir, tag, prog, stopped, iso_ok=iso_ok)
+        return unpack_cdi(job.path, outdir, tag, prog, stopped)
+
+    def do_unpack(self, job, o):
+        """.pbp / .cdi / .mds / .nrg / .ccd / .img -> CUE/BIN files in their own folder, no CHD."""
+        stem, n = job.path.stem, job.disc_count
+        out = self.output_path(job, o, ".cue").parent / stem
+        if out.exists() and any(out.iterdir()):
+            if o["exists"] == "Skip":
+                job.status, job.result = "Skipped (exists)", f"{out.name} already exists (see 'If output exists' in Settings)"
+                self.post("log", f"Skipped {job.path.name}: folder {out.name} already exists.", "warn")
+                return
+            if o["exists"] == "Rename":
+                k = 1
+                while out.with_name(f"{stem} ({k})").exists():
+                    k += 1
+                out = out.with_name(f"{stem} ({k})")
+        created = not out.exists()
+        out.mkdir(parents=True, exist_ok=True)
+        bases = pbp_discs(job.path) if job.container == "pbp" else [None]
+        cues = []
+        try:
+            for i in range(n):
+                label = f" disc {i + 1} of {n}" if n > 1 else ""
+                last = [-1]
+
+                def prog(x, label=label):
+                    pct = int(100 * x)
+                    if pct != last[0]:
+                        last[0] = pct
+                        job.status = f"Unpacking{label} {pct}%"
+                        self.post("job", job)
+                        self.post("progress", pct)
+
+                self.post("log", f"\n{job.path.name}{label}  [unpacking {job.path.suffix[1:].upper()}]", "info")
+                cues.append(self.unpack_job(job, bases[i], out, f"{stem} (Disc {i + 1})" if n > 1 else stem, prog))
+        except UnpackError as e:
+            if self.stop_flag:
+                job.status = "Stopped"
+            else:
+                job.status, job.result = "Failed (can't unpack)", str(e)
+                self.post("log", f"{job.path.name}: {e}", "err")
+        except OSError as e:
+            job.status, job.result = "Failed (disk)", str(e)
+            self.post("log", f"{job.path.name}: {e}", "err")
+        else:
+            job.out_path = cues[0]
+            job.out_size = sum(f.stat().st_size for f in out.iterdir() if f.is_file())
+            job.status, job.result = "Done", f"→ {out.name}\\"
+            self.post("log", f"OK  {out}", "ok")
+        finally:
+            if created and not job.status.startswith("Done"):
+                shutil.rmtree(out, ignore_errors=True)
+
     def do_convert_container(self, job, o):
         """.pbp / .cdi -> unpack to CUE/BIN in a temporary folder, then chdman createcd. A multi-disc PBP
         becomes one CHD per disc plus an .m3u playlist."""
@@ -3073,13 +3308,7 @@ class App:
                 tag = f"{stem} (Disc {i + 1})" if n > 1 else stem
                 self.post("log", f"\n{job.path.name}{label}  [unpacking {job.path.suffix[1:].upper()}]", "info")
                 try:
-                    if job.container == "pbp":
-                        cue = unpack_pbp_disc(job.path, bases[i], tmp, tag, prog, lambda: self.stop_flag)
-                    elif job.container == "image":
-                        cue = unpack_tracks(read_image(job.path), tmp, tag, prog, lambda: self.stop_flag,
-                                            iso_ok=job.type == "DVD" and self.has_dvd)
-                    else:
-                        cue = unpack_cdi(job.path, tmp, tag, prog, lambda: self.stop_flag)
+                    cue = self.unpack_job(job, bases[i], tmp, tag, prog, iso_ok=job.type == "DVD" and self.has_dvd)
                 except UnpackError as e:
                     if self.stop_flag:
                         job.status = "Stopped"
@@ -3235,7 +3464,7 @@ class App:
             job.status = "Failed (unknown CHD)"
             self.post("log", f"{job.path.name}: cannot read this CHD.", "err")
             return
-        fmt = o.get("extract_format", "auto")
+        fmt = self.fmt_for(job, o)
         if fmt == "pbp" or job.path.suffix.lower() == ".m3u":
             if fmt != "pbp":
                 job.status, job.result = "Failed (choose PBP)", "A playlist can only be combined into a PBP: choose PlayStation PBP under 'CHD files'."
@@ -4001,6 +4230,7 @@ class App:
                     self.on_app_update_done(ev[1], ev[2])
                 elif kind == "finish":
                     self.running = False
+                    self.root.after_idle(self.autofit_columns)
                     self.start_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
                     self.status.config(text=ev[1])
