@@ -38,7 +38,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "2.0.0"
+APP_VER = "2.0.1"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -3373,6 +3373,35 @@ def find_base_pbp(saved=""):
     return None
 
 
+PATH_SETTINGS = ("chdman", "base_pbp", "art_dir", "out_dir", "dolphintool", "last_dir")
+
+
+def relocate_settings(settings, here=None):
+    """The program folder was moved: saved paths that pointed inside the old folder now point inside the new one, and a
+    saved file that is gone but sits next to the program under the same name (BASE.PBP, chdman.exe...) is found again.
+    Changes `settings` in place; returns the names of the settings that changed."""
+    here = Path(here or HERE)
+    norm = lambda p: os.path.normcase(os.path.normpath(str(p)))  # noqa: E731
+    old = settings.get("app_dir", "")
+    changed = []
+    for k in PATH_SETTINGS:
+        v = settings.get(k) or ""
+        if not v:
+            continue
+        new = None
+        if old and norm(old) != norm(here):
+            try:
+                new = here / Path(v).relative_to(old)
+            except ValueError:
+                pass
+        if new is None and k in ("chdman", "base_pbp", "dolphintool") and not Path(v).exists():
+            new = here / Path(v).name
+        if new is not None and norm(new) != norm(v) and new.exists():
+            settings[k] = str(new)
+            changed.append(k)
+    return changed
+
+
 def download_base_pbp(dest_dir):
     """Fetch BASE.PBP and DATA.PSP into dest_dir, each checked against its fixed checksum, and keep them only if
     together they make a usable base."""
@@ -4192,6 +4221,7 @@ class App:
             self.settings.update(json.loads(SETTINGS_FILE.read_text("utf-8")))
         except Exception:  # noqa: BLE001
             pass
+        moved = relocate_settings(self.settings)
         CHDMAN = find_chdman(self.settings.get("chdman", ""))
         restored = None
         if not CHDMAN:
@@ -4199,6 +4229,8 @@ class App:
             CHDMAN = find_chdman("")
         self.chd_version, self.has_dvd = chdman_info()
         self.build_ui()
+        if moved:
+            self.log(f"The program folder has moved, so {len(moved)} saved path(s) were updated to the new location.", "info")
         if restored:
             self.log(f"chdman.exe was missing, so the spare copy built into this program was restored: {restored}", "warn")
         if CHDMAN:
@@ -5133,6 +5165,7 @@ class App:
         d = {k: var.get() for k, var in self.v.items()}
         d["chdman"] = self.chd_path_var.get() if hasattr(self, "chd_path_var") else ""
         d["last_dir"] = self.settings.get("last_dir", "")
+        d["app_dir"] = str(HERE)                  # lets the next start notice that the program folder was moved
         try:
             d["geometry"] = self.root.geometry()
         except tk.TclError:
@@ -5417,6 +5450,9 @@ class App:
             self.update_status_idle()
             return False
         self.log(f"Saved BASE.PBP and DATA.PSP next to the program ({HERE}).", "ok")
+        if (HERE / "BASE.PBP").is_file():
+            self.v["base_pbp"].set(str(HERE / "BASE.PBP"))          # select it, so nothing has to be browsed for
+            self.save_settings()
         self.update_status_idle()
         return True
 
