@@ -1,5 +1,5 @@
 """
-CHD Manager - a friendly GUI for MAME's chdman.exe
+CHD Manager - convert game disc images between formats (CHD, PBP, CSO/ZSO, ECM, RVZ, WBFS and more)
 
 Put this file next to chdman.exe (or point it at chdman.exe in Settings, Output page).
 Needs only Python 3 (tkinter is included with it). Double-click to run.
@@ -38,7 +38,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CHD Manager"
-APP_VER = "1.5.0"
+APP_VER = "2.0.0"
 FROZEN = getattr(sys, "frozen", False)          # True when running as the packaged .exe
 HERE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "chd_manager_settings.json"
@@ -4546,7 +4546,7 @@ class App:
             lab.grid(row=0, column=i, padx=(0, 18))
             lab.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
         ttk.Label(f, style="Muted.TLabel", wraplength=600, justify="left",
-                  text="Free and open source (0BSD license). chdman and the other bundled parts keep their own licenses, "
+                  text="Free and open source (GNU GPL v3 or later). chdman and the other bundled parts keep their own licenses, "
                        "listed in THIRD_PARTY_NOTICES.txt. Not affiliated with MAME. No games or BIOS files are included; "
                        "use it only with discs you own.").grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 6))
         ttk.Separator(f).grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
@@ -4689,7 +4689,7 @@ class App:
                      for k in range(4)]
         c.create_oval(cx - 7, cy - 7, cx + 7, cy + 7, fill=base, outline="#ffffff", width=2)
         c.create_text(76, 23, text="CHD Manager", anchor="w", fill="#ffffff", font=("Segoe UI Semibold", 17))
-        c.create_text(78, 47, text="Compress & convert disc images  ·  CD / DVD detected for you", anchor="w",
+        c.create_text(78, 47, text="Convert game disc images between formats  ·  CD / DVD detected for you", anchor="w",
                       fill="#eef0ff", font=("Segoe UI", 9))
         label, col = {"idle": ("●  Ready", "#ffffff"), "run": ("●  Working…", "#fff1b8"),
                       "done": ("✔  Finished", "#c9ffe4"), "fail": ("●  Finished with errors", "#ffd4d4")}[self.hdr_state]
@@ -4925,7 +4925,7 @@ class App:
         if avail < 200 or self.running and only is None:
             return
         f, pad = self.tree_font(), 26
-        caps = {"file": 520, "result": 520, "status": 260, "action": 330, "platform": 140, "type": 120, "size": 110}
+        caps = {"file": 520, "result": 520, "status": 260, "action": 330, "platform": 140, "type": 150, "size": 110}
         floor = {"file": 150, "result": 120, "status": 110, "action": 110, "platform": 80, "type": 70, "size": 70}
         want = {}
         for c in cols:
@@ -5069,7 +5069,10 @@ class App:
     def open_settings(self, tab="Convert"):
         w = self.settings_win
         if not getattr(self, "_settings_placed", False):
-            w.geometry(f"780x700+{max(self.root.winfo_rootx() + 80, 0)}+{max(self.root.winfo_rooty() + 40, 0)}")
+            w.update_idletasks()        # on a scaled display the pages are bigger than 780x700: fit the tallest one
+            ww = min(max(780, w.winfo_reqwidth() + 8), w.winfo_screenwidth() - 60)
+            hh = min(max(700, w.winfo_reqheight() + 8), w.winfo_screenheight() - 90)
+            w.geometry(f"{ww}x{hh}+{max(self.root.winfo_rootx() + 80, 0)}+{max(self.root.winfo_rooty() + 40, 0)}")
             self._settings_placed = True
         w.deiconify()
         w.lift()

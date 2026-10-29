@@ -1,88 +1,116 @@
 # CHD Manager
 
-A friendly Windows app for turning disc images (`.cue`/`.bin`, `.gdi`, `.iso`, PlayStation `.pbp`, DiscJuggler `.cdi`, Alcohol `.mds`/`.mdf`, Nero `.nrg`, CloneCD `.ccd`/`.img`) into compressed **CHD** files and back again, and for turning CHDs into PlayStation `.pbp` or DiscJuggler `.cdi` files. It works out whether each disc is a **CD or a DVD** for you, so there is no "which button do I press" guessing, and it picks sensible settings for your PC.
+A friendly Windows app that converts game disc images from one format to another, and the front end for MAME's `chdman`: **CHD, PBP, CDI, CSO/ZSO, ECM, ISO, CUE/BIN, GDI** for PlayStation, Dreamcast, Saturn, Sega CD and PSP, and **RVZ, WIA, WBFS, GCZ, CISO, WUX/WUD** for GameCube, Wii and Wii U. Add your files, pick what each one should become, and press Start. It works out what each disc is, only offers conversions that can work, checks there is room on the drive before it starts, and verifies what it wrote.
 
-CHD Manager is a front end for `chdman`, the tool from the [MAME](https://github.com/mamedev/mame) project. It is portable: one folder, nothing installed, nothing written outside it.
+It is portable: one folder, nothing installed. CHD conversions are done by `chdman` from the [MAME](https://github.com/mamedev/mame) project; the other formats are handled by the program's own code.
 
 ![CHD Manager, dark theme](docs/screenshot-dark.png)
 
 <details>
-<summary>Light theme</summary>
+<summary>Light theme and settings</summary>
 
 ![CHD Manager, light theme](docs/screenshot-light.png)
 
-</details>
+![The Formats page of the settings window](docs/screenshot-formats.png)
 
-<details>
-<summary>Working with CHD files</summary>
+![The Convert page of the settings window](docs/screenshot-settings.png)
 
-![CHD Manager with CHD files in the list and the CHD files choice at the top](docs/screenshot-chd.png)
-
-![The CHD files page of the settings window](docs/screenshot-chd-settings.png)
+![The About page of the settings window](docs/screenshot-about.png)
 
 </details>
 
-<details>
-<summary>Settings window, About page</summary>
+## What it converts
 
-![CHD Manager, settings window on the About page](docs/screenshot-about.png)
+Each file in the list has an **Action** drop-down; it only offers what can work for that file.
 
-![CHD Manager, settings window on the Convert page](docs/screenshot-settings.png)
+| Format | What it is | Read | Write |
+| --- | --- | :-: | :-: |
+| **CHD** | MAME's compressed disc format, used by MAME, DuckStation, PCSX2, Flycast, RetroArch and others (CD, DVD and Dreamcast GD-ROM) | yes | yes |
+| **CUE/BIN, GDI, ISO** | Plain disc images (one BIN per track or a single BIN; GDI for Dreamcast) | yes | yes |
+| **PBP** | PlayStation 1 games for the PSP and Vita (multi-disc too), with optional artwork or a drawn title card | yes | yes |
+| **CDI** | DiscJuggler images (including Dreamcast CD-Rs) | yes | yes |
+| **MDS/MDF, NRG, CCD/IMG** | Alcohol 120%, Nero and CloneCD images | yes | no |
+| **CSO, ZSO** | Compressed PSP/PS2 ISOs (CSO uses deflate, ZSO uses LZ4); `.ciso` PSP files are read too | yes | yes |
+| **ECM** | Neill Corlett's format that removes the error-correction data from raw CD images | yes | yes |
+| **RVZ, WIA** | Dolphin's compressed GameCube and Wii formats | yes | yes |
+| **WBFS** | The Wii backup-manager format (split `.wbf1` files are read too) | yes | yes |
+| **GCZ, CISO** | Dolphin's older compressed formats | yes | yes |
+| **WUX, WUD** | Wii U disc images (compressed and raw) | yes | yes, in both directions |
+| **ZIP, TAR, GZ, 7Z, RAR** | Archives are opened as input (7Z and RAR use 7-Zip) | yes | n/a |
 
-</details>
+Also: **rebuild a CD's error correction** (Mode 1 and Mode 2 Form 1, so a CUE/BIN with blank EDC/ECC data becomes a full-size, correct image), **extract the artwork from a PBP**, and **title cards** that give a PBP a readable name and code in the PSP menu when you have no artwork of your own.
+
+Wii discs and keys: turning a **Wii** disc into RVZ, WIA or WBFS needs either your own copy of Dolphin (the program just runs its `DolphinTool.exe`) or your own Wii key. This program contains no key and never downloads one; see [Wii and GameCube](#wii-and-gamecube). Everything else, including reading any format and converting GameCube or Wii U discs, needs neither.
 
 ## Features
 
-- **Drag and drop** files or folders onto the window, or onto the exe itself (or use *Open with*), or use Add Files / Add Folder. Folders are searched recursively.
-- **Queue** of files or folders. Loose `.bin` files that already belong to a `.cue` are skipped.
-- **CD or DVD, detected automatically.** `.cue`/`.gdi`/`.toc` are CD. An `.iso` is CD if it fits on a CD, DVD if it is larger, and PSP images are DVD. It also looks inside the image to label the platform (PS1, PS2, PSP, Dreamcast, Saturn, Sega CD). Right-click any item to force CD or DVD.
-- **PBP and CDI files work too.** PlayStation 1 `.pbp` files (including multi-disc ones, which become one CHD per disc plus an `.m3u` playlist) and DiscJuggler `.cdi` files (including Dreamcast CD-Rs with their two sessions) are unpacked in a hidden temporary folder, converted, and the temporary files are removed. Your original is never changed. PSP `.pbp` files are not PS1 discs and are refused with a message.
-- **Other disc-image formats too.** Alcohol 120% `.mds` + `.mdf`, Nero `.nrg`, CloneCD `.ccd` + `.img` and a bare `.img` are read directly and converted the same way (no need to convert them to CUE/BIN first). Drop either file of a pair; the partner is found next to it. Subchannel data (`.sub`) can't be stored in a CHD and is not used. Multi-session images are refused with a message.
-- **CHD to PBP and CHD to CDI.** With a CHD in the list, choose **PlayStation PBP** or **DiscJuggler CDI** as the format under *CHD files*. A PBP is made for PlayStation 1 discs only (the game code is read from the disc) and is verified by reading it back. For a **real PSP with custom firmware** it also needs Sony's PS1 loader, icon and boot logo, which CHD Manager does not ship: the first time you make a PBP it offers to download a generic base PBP (`BASE.PBP` and `DATA.PSP`, two small files from the public [iPoPS](https://github.com/julianxhokaxhiu/iPoPS) repository, pinned to one commit and checked against fixed checksums) and keeps them next to the exe. You can instead pick any working PS1 `.pbp` of your own in *Settings, CHD files*. Without a base, the PBP still works in emulators and frontends that read PBP. To make one PBP from a multi-disc game, add the game's `.m3u` playlist (the one this app writes next to the CHDs) instead of the separate CHDs. CDI is experimental.
-- **You choose what happens to CHD files.** Disc images (`.cue`, `.gdi`, `.iso`, `.toc`) become CHDs. When a CHD is in the list, a **CHD files** choice appears at the top: **Extract** it back to a disc image, **Verify** it, or **Recompress** it with different compression (your original is kept). When extracting you pick the format: **Automatic** (CUE/BIN for CDs, GDI for Dreamcast, ISO for DVDs), **ISO** for data discs, or CUE/BIN with one BIN per track or one single BIN. Automatic reads each CD's track count first: a disc with several tracks (audio plus data) gets one BIN per track, and a one-track disc gets a single BIN, with no setting to remember. Anything that comes out as several files (split CDs, Dreamcast GDI) is put in its own folder named after the disc, so a big batch stays tidy. ISO is only offered when nothing would be lost, so discs with audio, several tracks, or PS1-style audio/video sectors are refused instead of mangled. The Action column always spells out what will happen to each file, you can override a single file by right-clicking it, and a skipped job says why.
-- **Suggested settings.** It looks at your PC and your queue and fills in thread count, compression, and so on, with the reason for each. Weak PCs automatically get low-priority mode so Windows stays usable.
-- **Safety.** Optional verify after creating each CHD. Optional "send sources to the Recycle Bin", and only after the new CHD passed verification, so your source files are never permanently deleted.
-- **Options.** Compression presets or custom codecs, hunk size, threads, skip/overwrite/rename existing files, output folder (with folder structure kept), per-track `.bin` extraction.
-- **Progress and log** for every job, an Info window, a summary of the space you saved, and a dark and a light theme.
-- **Updates.** The two version buttons at the bottom of the window (chdman on the left, CHD Manager on the right) are also the update buttons: click one to check, and it turns orange when an update is waiting. One click checks MAME's latest chdman and, if you confirm, installs it (checksum-verified, with a backup of the old one). CHD Manager can also update itself from this repo's releases: it checks the SHA-256, test-runs the new version, then swaps it in and restarts. The prompt offers **Update now**, **Remind me next time**, or **Skip this version**, and a small badge stays in the window's header either way.
-- **A settings window** (More menu, or *Change settings…*) with the conversion options, output folder, the suggested-settings explanation, and an About page with the version, links, license info, the CHD Manager update controls, and a *Copy diagnostics* button for bug reports (it leaves out your folder paths and user name).
-- **A calm layout.** One list of discs, one line saying which settings will be used, and one Start button. The settings window, the log and the less common actions (verify, info, theme, updates) stay out of the way until you want them, and the log opens by itself if something fails. The window also scales sensibly when you resize it.
+- **Drag and drop** files or folders onto the window or the exe, or use Add Files / Add Folder. Folders are searched recursively.
+- **One Action choice per file.** Click the cell to change it, or the *Action* heading to set it for every file that can do it. A skipped job says why.
+- **CD or DVD, detected automatically** for CHD, with the platform labelled (PS1, PS2, PSP, Dreamcast, Saturn, Sega CD, GameCube, Wii, Wii U). Right-click to force CD or DVD.
+- **Any format to any format it can produce.** Where there is no direct route the program goes through a temporary, uncompressed CHD, so every target is written by the same code whatever the source.
+- **Safety.** Optional verify after each conversion (a CHD's SHA-1, or reading the result back and comparing it with the source for the formats that allow it). Optional "send sources to the Recycle Bin", only after a verified result. Optionally delete them permanently instead, which frees the space at once (off by default, with a warning).
+- **Disk-space check.** Before each job the program estimates the most space it will use, including temporary files, and refuses it with a plain message when it clearly won't fit, instead of failing halfway and leaving a partial file.
+- **Suggested settings.** Looks at your PC and your queue and fills in thread count, compression and so on, with the reason for each.
+- **File names** from the game's title, ID or region (`%FILENAME% %GAMEID% %TITLE% %MAINTITLE% %REGION%`), using PlayStation game data or the name stored on a GameCube/Wii disc.
+- **Command line** (`chdm`): the same conversions without a window. See [Command line](#command-line).
+- **Updates.** The two version buttons at the bottom of the window (chdman on the left, the program on the right) are also the update buttons. Updates are checksum-verified, test-run, and never installed without you confirming.
+- **Progress and log** for every job, a summary of the space you saved, a dark and a light theme, and a settings window with an About page and a *Copy diagnostics* button for bug reports (it leaves out your folder paths and user name).
 
 ## Download and use
 
 1. Get the zip from the [Releases](../../releases) page and unzip it anywhere.
 2. Run **CHD Manager.exe**.
-3. Click **Add Files** or **Add Folder** (or drag them in), glance at the settings line under the list, and press **Start**.
+3. Click **Add Files** or **Add Folder** (or drag them in), check the Action column, and press **Start**.
 
 Windows 10/11, 64-bit. Python is not needed. Settings are saved in `chd_manager_settings.json` next to the exe.
 
 **About warnings:** the exe is not code-signed, so Windows SmartScreen may say "unknown publisher" (choose *More info → Run anyway*) and some antivirus programs are suspicious of this kind of packaged Python program. If you would rather not run a binary, [run it from source](#run-from-source) or [build it yourself](#build-the-exe).
 
-## How CD vs DVD is chosen
+## Wii and GameCube
+
+- **GameCube discs** work with no setup in every direction (ISO, RVZ, WIA, GCZ, CISO).
+- **Wii discs** can always be read, and written to ISO, GCZ and CISO. To write **RVZ, WIA or WBFS** the program needs one of these (open *Settings, Formats, Wii setup*, or use the prompt at startup):
+  1. **Dolphin on your PC.** Show the program where Dolphin is. It runs Dolphin's own `DolphinTool.exe` for those conversions; no key is needed.
+  2. **Your own Wii key.** Put it in the `keys` folder next to the program (a text file holding the 32-character key), choose the file, or paste it in the setup window.
+- The program does **not include** a Wii key and never fetches one. Without either option those three conversions are simply not offered.
+- Wii U discs (`.wux`, `.wud`) need nothing.
+
+## Command line
+
+The `chdm.cmd` launcher in the zip runs the same conversions without a window and passes on the exit code (0 = everything done or skipped, 1 = something failed, 2 = wrong command line):
+
+```
+chdm game.cue --to chd -o D:\chd
+chdm game.chd --to pbp --level 9 -o D:\psp
+chdm D:\roms --to chd --exists overwrite --log convert.txt
+chdm game.chd game2.iso --list
+chdm --help
+```
+
+`--list` shows what each file can become. In `cmd`, run it as `.\chdm` (or put the folder on your PATH). The exe alone returns immediately because it is a windowed program; the launcher is what waits.
+
+## How CD vs DVD is chosen for CHD
 
 | Image | Type |
 | --- | --- |
 | `.cue`, `.gdi`, `.toc`, loose `.bin` | CD (`createcd`) |
-| `.pbp` (PlayStation 1), `.cdi` (DiscJuggler), `.mds`/`.mdf`, `.nrg`, `.ccd`/`.img`, bare `.img` | CD: unpacked to `.cue`/`.bin` in a temporary folder first, then `createcd` (a lone 2048-byte data track larger than a CD goes through `createdvd`) |
+| `.pbp` (PlayStation 1), `.cdi`, `.mds`/`.mdf`, `.nrg`, `.ccd`/`.img`, bare `.img` | CD: unpacked to `.cue`/`.bin` in a temporary folder first, then `createcd` |
 | `.iso` up to 737,280,000 bytes (an 80-minute CD) | CD |
-| `.iso` larger than that | DVD (`createdvd`) |
-| PSP images | DVD |
+| `.iso` larger than that, and PSP images | DVD (`createdvd`) |
 
-If a PS2 game on a CD slightly exceeds the size limit, or anything else is detected wrongly, right-click it and force the type.
-
-Many PS2 CHDs you find online are CD-type (made with `createcd`), even for big DVD games. CHD Manager builds DVD-type CHDs for big ISOs. Both are valid CHDs, the DVD-type came out 0.6-2% smaller in testing, and both booted in PCSX2, but check that one game boots before converting a collection.
+If a PS2 game on a CD slightly exceeds the size limit, or anything else is detected wrongly, right-click it and force the type. Many PS2 CHDs you find online are CD-type; this program builds DVD-type CHDs for big ISOs. Both are valid and both booted in PCSX2, but check that one game boots before converting a collection.
 
 ## Network use
 
-CHD Manager is offline except for the update checks. Each has its own on/off switch (chdman in the settings window's **Output** page, CHD Manager on its **About** page):
+The program is offline except for the update checks, each with its own on/off switch (chdman on the *Output* page of the settings window, the program on its *About* page):
 
-- At startup it asks GitHub for the number of the latest MAME release, and for the latest CHD Manager release. It never downloads anything by itself.
-- When you confirm a CHD Manager update, it downloads the release zip from this repo (`github.com/Mr-Shizzy/CHD-Manager`), verifies its SHA-256, and only then replaces itself. If you're running the script instead of the exe, it just offers to open the download page.
-- When you press the chdman update button and confirm, it downloads the official release from `github.com/mamedev/mame`. Opening that download needs [7-Zip](https://7-zip.org). If it is missing, the app offers to install it with `winget`, and if you decline only the update button stops working.
+- At startup it asks GitHub for the latest MAME release number and the latest CHD Manager release. It never downloads anything by itself.
+- When you confirm a CHD Manager update it downloads the release zip from this repo, verifies its SHA-256, and only then replaces itself. When you confirm a chdman update it downloads the official release from `github.com/mamedev/mame` (opening it needs [7-Zip](https://7-zip.org); the app can install it with `winget` if you agree).
+- Two optional downloads, each only on request and checked against a fixed checksum: the base PBP files for a real PSP (from [iPoPS](https://github.com/julianxhokaxhiu/iPoPS)) and a refreshed game list.
 
 ## Run from source
 
-Needs Python 3 with tkinter (tested with 3.12) and `chdman.exe` from a [MAME release](https://github.com/mamedev/mame/releases) placed next to the script:
+Needs Python 3 with tkinter (tested with 3.12), `chdman.exe` from a [MAME release](https://github.com/mamedev/mame/releases) next to the script, and `pip install zstandard` for RVZ and ZSO:
 
 ```
 python CHD_Manager.pyw
@@ -96,47 +124,45 @@ Needs Python 3 (tested with 3.12) and 7-Zip.
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-This installs PyInstaller, downloads the latest official chdman (checking its SHA-256), builds `CHD Manager.exe`, and writes the portable folder and a zip to `dist/`. Use `-ChdmanPath` to supply your own chdman instead.
+This installs PyInstaller and zstandard, downloads the latest official chdman and the game list (checking the SHA-256 of both), builds `CHD Manager.exe`, and writes the portable folder and a zip to `dist/`. Use `-ChdmanPath` to supply your own chdman.
 
 ## Testing
 
-Tested on Windows 11 against **42 real discs**: 6 Dreamcast GD-ROM, 3 Dreamcast CD, 16 PS1 and 17 PS2 (7.3 GB of CHDs, 24 GB uncompressed). The test drove the app's own code (folder scan, detection, suggested settings, convert, extract, verify) with chdman 0.289:
+Everything below was run on Windows 11 with chdman 0.289. The program's own code is driven by automated test scripts; the sample discs are my own backups.
+
+**CHD, PBP, CDI and image formats (versions 1.x, still passing):** 42 real discs (6 Dreamcast GD-ROM, 3 Dreamcast CD, 16 PS1, 17 PS2) verified, extracted and rebuilt with the same data SHA-1 as the originals; boots in PCSX2 nightly, DuckStation and RetroArch/Flycast. PBP files (including a 2-disc and a 4-disc game) were converted both ways and booted in DuckStation; on a **real PSP** (6.61 ARK-5 custom firmware) a one-disc game made with the downloaded base booted and played, and a 2-disc game booted and switched to disc 2. CDI files for four Dreamcast CD-Rs were read back and compared; three booted in Flycast and the fourth reached its title screen. MDS/MDF, NRG, IMG and CCD images each gave a CHD with the expected data checksum.
+
+**New in 2.0:**
 
 | Check | Result |
 | --- | --- |
-| Verify all 42 existing CHDs | 42 / 42 passed |
-| Extract all 42 (to `.cue`/`.bin` and `.gdi`) | 42 / 42 |
-| Rebuild all 42 with the default settings | 42 / 42 have the **same data SHA-1 as the original CHD**; file sizes within -5.9% to +0.3% (median 0.0%) |
-| Platform label (PS1 / PS2 / Dreamcast) | 42 / 42 |
-| DVD path on two real PS2 ISOs (4.4 GB and 1.4 GB) | built as DVD-type CHDs, verified, extracted back to an ISO with the same SHA-1 as the source |
-| Playback in emulators (boot and intro, not played through) | **PS2** in PCSX2 nightly 2.9.146: a CD-type CHD, a DVD-type CHD of the same game, and a 4.4 GB DVD-type CHD built by CHD Manager all booted (the DVD-type files log a harmless "Failed to parse CHD TOC" line). **PS1** in DuckStation 0.1.12074: one game rebuilt at six settings (default, none, zlib, LZMA, zstd, doubled hunk) all booted identically, and a 32-track CD-audio disc and an English-patched game behaved exactly like the original CHDs. **Dreamcast** in RetroArch with the Flycast core: one GD-ROM rebuilt at the same six settings, a second GD-ROM, and a CD-type self-boot disc that starts with audio tracks all booted. |
-| Many-track discs (32, 11 and 2 tracks), extracted with Automatic (split per track) and rebuilt | identical data; a one-track disc stays one BIN |
-| CHD to ISO (new in 1.4) | a CD CHD with Mode 2 raw sectors became a valid 2048-byte-per-sector ISO that PCSX2 booted; a MODE1/2048 CD CHD became an ISO byte-identical to an independently verified one; audio, multi-track, PS1-style Form 2 and GD-ROM discs were refused with a reason and left no files |
-| Recompress CHD (new in 1.4) | CD, GD-ROM and DVD CHDs recompressed with the same data checksum; the original is never overwritten |
-| PBP and CDI (new in 1.5) | 5 PBP files (one 2-disc, one 4-disc) and 4 Dreamcast CDI files converted and verified. Every sector of the PBP output has a valid sync pattern and the right address. PS1 games booted in DuckStation; Dreamcast CD-Rs booted in RetroArch/Flycast (menus, a race, a homebrew program's own screen) |
-| CHD to PBP (new in 1.5) | A one-disc game and a 2-disc game (through its playlist) were turned into PBPs, read back and compared block by block with the source, and unpacked again to byte-identical discs. For one game the first 16 KB of the PBP matched the original PBP except for size fields and the title. The single-disc and the 2-disc PBPs booted in DuckStation. **On a real PSP** (6.61 ARK-5 custom firmware) a one-disc game made with the downloaded base booted and played, and a 2-disc game booted and switching to disc 2 worked. A first attempt crashed the PSP twice and led to two fixes: the loader inside `BASE.PBP` is Sony's encrypted one, which only runs signed content (so a plain `DATA.PSP` is used instead), and the multi-disc header now matches the layout of real multi-disc PBPs |
-| CHD to CDI (new in 1.5) | 4 Dreamcast CD-Rs: the CDI was read back and compared with the disc it was made from. The Aqua GT CDI came out the same size as the original with a header that differed only in a timestamp and a file name. Sturmwind and Millenium Racer booted in RetroArch/Flycast (title menu, a race), Aqua GT reached its title screen. The Dreamcast data session is placed at the sector its own filesystem expects, which is what made Sturmwind boot |
-| MDS/MDF, NRG, IMG, CCD (new in 1.5) | a real Alcohol `.mds`/`.mdf` (one data track), a real Nero `.nrg` (one data track), two bare `.img` files and a DVD-type `.mds` converted and verified; a two-track (data + audio) `.mds`/`.mdf` written by the independent tool Aaru gave a CHD with the same data SHA-1 as the original CUE/BIN; a two-track `.ccd`/`.img` pair written by Aaru, and another made by hand, each gave a CHD with the same data SHA-1 as the original CUE/BIN |
-| Corrupted, truncated and non-CHD files | all flagged as failed, nothing crashed |
-| Overwrite / skip / rename, lone `.bin`, "recycle sources after a verified CHD" | behaved as described |
+| Mode 1 error correction (EDC/ECC) | Rebuilt on 43,997 real Sega CD sectors: 0 differences from the originals |
+| ECM | Encoded and decoded back to identical images (own encoder/decoder, written from the format description) |
+| ZSO (LZ4) | Compressor and decompressor cross-checked against the real `lz4` library, both directions |
+| GameCube and Wii: reading | 6 sample RVZ files (zstd and LZMA, GameCube and Wii) and one WBFS were converted to ISO and compared with the output of Dolphin's own `DolphinTool`: byte-identical |
+| GameCube and Wii: writing | Our RVZ (zstd and LZMA), WIA, GCZ and CISO files were opened by DolphinTool and gave the same disc; a scrubbed WBFS extracted 59 of 59 identical files |
+| Speed | A 4.7 GB Wii disc to RVZ in about 19 s; RVZ back to ISO in about 31-75 s |
+| Wii U | A real `.wux` converted to `.wud` and back to `.wux` and held the same disc |
+| Disk-space check | Tested with a simulated small drive: a job that cannot fit is refused with a clear message, the next job still runs, nothing partial is left |
+| Command line | Checked on a built exe: exit codes 0/1/2, output and redirection |
+| Automated suites | About 20 test scripts covering every conversion route; all pass |
 
-**Compression levels** (7 discs, CD-type, up to 4.4 GB), size relative to the default settings: LZMA-only 100.5%, zlib ("Fast") 108%, zstd 104% and 1.8x slower, doubling the hunk size 95% (0.6% smaller on the big disc, up to 10% on small ones). All of those settings, including zstd, uncompressed and the larger hunk, booted in DuckStation and Flycast. The default is still the right choice for almost everything.
+**Not tested:**
 
-**Threads** (a 286 MB disc): 1 thread 34 s, 4 threads 11 s, 8 threads 5 s, 16 threads 3.9 s, 22 threads 3.8 s. Speed stops improving at around 16. Low-priority mode cost nothing on an idle PC.
+- Any of the new formats on real hardware or in every emulator: RVZ/WIA/GCZ/CISO/WBFS were checked against Dolphin's tool but not played in Dolphin; ZSO was not tried in PPSSPP or PCSX2; the new title cards were not tried on a real PSP; Wii U output was not tried in Cemu.
+- Files made by other programs for some formats: CISO, GCZ, WIA with purge compression, and split WBFS files; ECM files made by other tools; ECM's "Form 2" sector type.
+- WBFS shrinking of an unscrubbed disc (the samples were already scrubbed); the Dolphin route for WBFS was only proven on those.
+- CISO cannot store a disc's exact size (the last block is always kept).
+- Multi-track `.nrg` files, CloneCD files made by CloneCD itself, multi-session images, CDI files in DiscJuggler itself, PBPs on a PSP Go, Vita or PS Classic, discs 3 and later of multi-disc games, and playing any game all the way through.
+- Other versions of chdman or Windows.
 
-**Bugs this testing found, fixed in 1.2.1:** "None" compression plus verify reported a false failure; chdman's real error text was hidden when a job failed; three Dreamcast CD discs that start with audio tracks got no platform label; folders containing unsupported image files were skipped silently.
-
-**Not tested (PBP and CDI):** every disc of every multi-disc game (I booted discs 1 and 2 of the 2-disc game and discs 1 and 4 of the 4-disc one), swapping discs in a player, CDI files other than Dreamcast CD-Rs, and PBPs with audio tracks other than one patched test file. PSP game `.pbp` files (not PS1 discs) are not supported.
-
-**Not tested (new formats):** multi-track `.nrg` files (no tool I had could write one), CloneCD files written by CloneCD itself (the two I tested came from Aaru and from my own code; Aaru's has no `[TRACK]` sections, which the reader copes with), multi-session images, `.nrg` files written in the older Nero format, CDI files in DiscJuggler itself (only read back by this program and booted in Flycast), PBP files on a PSP Go, a Vita or a PS Classic (only one PSP with ARK-5 custom firmware was tried), PBPs with more than two discs on a PSP, and PBPs with audio tracks written by this program.
-
-**Not tested:** playing any game through (I only checked that each boots and shows its intro), emulators other than PCSX2, DuckStation and RetroArch/Flycast, other versions of chdman, or other versions of Windows.
 ## Credits and license
 
-- `chdman` is from the [MAME](https://github.com/mamedev/mame) project and its authors. CHD Manager is not made by, affiliated with, or endorsed by MAME. "MAME" is a registered trademark of Gregory Ember.
-- The optional base PBP files for real-PSP use are downloaded on request from [iPoPS](https://github.com/julianxhokaxhiu/iPoPS) (MIT); they are not part of this project or its releases.
-- The PBP writer follows the file layout used by [PSXPackager](https://github.com/RupertAvery/PSXPackager) (MIT, by RupertAvery); no code from it is included. See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+- `chdman` is from the [MAME](https://github.com/mamedev/mame) project and its authors. This program is not made by, affiliated with, or endorsed by MAME. "MAME" is a registered trademark of Gregory Ember.
+- The GameCube and Wii disc code is a Python port of parts of the [Dolphin](https://github.com/dolphin-emu/dolphin) emulator's DiscIO code (GPL-2.0-or-later), and is the reason this project is GPL. Not affiliated with Dolphin.
+- The ECM format and reference tools are by Neill Corlett; ZSO uses the LZ4 block format by Yann Collet; PBP and CDI layouts were worked out with help from [PSXPackager](https://github.com/RupertAvery/PSXPackager) (MIT, RupertAvery), whose `gameInfo.db` game list ships in the zip. The Wii U formats follow the public format descriptions (the [Cemu](https://github.com/cemu-project/Cemu) source was consulted as a reference).
+- The optional base PBP files for real-PSP use are downloaded on request from [iPoPS](https://github.com/julianxhokaxhiu/iPoPS) (MIT); they are not part of this project.
 - Built with help from Claude (Anthropic); designed and tested by Mr-Shizzy.
-- This project includes no games, BIOS files, or other copyrighted game content. Use it only with discs you own.
+- This project includes no games, BIOS files, Wii keys or other copyrighted game content. Use it only with discs you own.
 
-CHD Manager's own code is under the [0BSD license](LICENSE): do whatever you like with it, no strings attached. Forks and remakes are welcome. The release bundles chdman, Python and Tcl/Tk, whose licenses are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+CHD Manager is free software under the [GNU General Public License, version 3 or (at your option) any later version](LICENSE). The release also bundles chdman, Python, Tcl/Tk and zstandard, whose licenses are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).

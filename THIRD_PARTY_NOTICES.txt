@@ -1,8 +1,11 @@
 THIRD-PARTY NOTICES
 
-CHD Manager's own code is under the 0BSD license (see LICENSE). The release build of
-CHD Manager.exe and the chdman.exe that ships with it contain third-party software.
-Their licenses are reproduced below, as those licenses require.
+CHD Manager is free software under the GNU General Public
+License, version 3 or (at your option) any later version (see LICENSE). That choice
+follows from the GameCube/Wii code below, which is a Python port of GPL-licensed code.
+The release build of CHD Manager.exe and the chdman.exe and gameInfo.db that ship
+with it contain or consist of third-party software. Their licenses are reproduced below,
+as those licenses require.
 
 
 ==============================================================================
@@ -1162,15 +1165,20 @@ the bundled program under any license.
 
 
 ==============================================================================
-5. PSXPackager  (format reference only - no code or data from it is in CHD Manager)
+5. PSXPackager  (PBP format reference, and the gameInfo.db game list that ships in the zip)
 ==============================================================================
-CHD Manager's code that reads and writes PlayStation .pbp files was written from
-scratch in Python, using PSXPackager (https://github.com/RupertAvery/PSXPackager)
-as a reference for the layout of the PBP file. No source code, program resources
-(icons, boot images, DATA.PSP) or binary templates from PSXPackager are included in
-CHD Manager or its release; a few fixed numbers that are part of the PBP format
-(such as the four constant words of a multi-disc header) are written into the
-output the same way. PSXPackager is released under the MIT license:
+The code that reads and writes PlayStation .pbp files was written from scratch in
+Python, using PSXPackager (https://github.com/RupertAvery/PSXPackager) as a reference
+for the layout of the PBP file. No source code, program resources (icons, boot images,
+DATA.PSP) or binary templates from PSXPackager are included; a few fixed numbers that
+are part of the PBP format (such as the four constant words of a multi-disc header) are
+written into the output the same way.
+
+The release zip does include one data file from that project, unmodified: gameInfo.db
+(the list of PlayStation game codes, titles and regions), taken from a pinned commit and
+checked against a fixed SHA-256 when the release is built. The program can also fetch it
+on request. It is used only to name files after a game. PSXPackager is released under
+the MIT license:
 
 MIT License
 
@@ -1209,3 +1217,81 @@ checked against fixed SHA-256 checksums). They are not part of CHD Manager, are 
 its repository or release, and are used only to copy the PS1 loader, icon and boot
 logo into the PBP files the user makes. Their contents may be subject to the rights of
 their original authors; the user is responsible for choosing to download them.
+
+
+==============================================================================
+7. Dolphin emulator  (code ported to Python: the GameCube / Wii disc formats)
+==============================================================================
+The code that reads and writes the WBFS, CISO, GCZ, WIA and RVZ disc formats (the block
+layouts, the Wii partition hashing and decryption, the exception lists and the lagged
+Fibonacci generator that reproduces "junk" data) follows the DiscIO code of the Dolphin
+emulator (https://github.com/dolphin-emu/dolphin), re-written here in Python. Dolphin's
+source files carry "SPDX-License-Identifier: GPL-2.0-or-later"; Copyright (c) the Dolphin
+Emulator Project and its contributors. This is the reason this program is GPL.
+
+CHD Manager contains no Wii common key and never downloads one. Turning a Wii disc
+into RVZ, WIA or WBFS needs either the user's own key (a keys folder next to the program,
+or pasted in Settings) or the user's own copy of Dolphin's DolphinTool.exe, which this
+program only runs; it does not include or copy it. Dolphin is not affiliated with this
+project.
+
+The Wii U formats (.wux, .wud) were written from the published description of the format;
+the Cemu emulator's documentation and source (https://github.com/cemu-project/Cemu,
+MPL-2.0) were consulted as a reference and no Cemu code is included.
+
+
+==============================================================================
+8. ECM  (file format by Neill Corlett)
+==============================================================================
+The .ecm reader and writer follow the format and the reference tools (ecm / unecm,
+"Error Code Modeler", Copyright (C) 2002 Neill Corlett, distributed under the GNU
+General Public License). They are re-written in Python. The Mode 1 / Mode 2 sector
+error correction (EDC and ECC) uses the standard CD-ROM definitions (ECMA-130).
+
+
+==============================================================================
+9. zstandard  (Python package, bundled in CHD Manager.exe; used for RVZ and ZSTD)
+==============================================================================
+The zstandard package (https://github.com/indygreg/python-zstandard) and the Zstandard
+library inside it (https://github.com/facebook/zstd, Copyright (c) Meta Platforms, Inc.
+and affiliates; used here under its BSD license) are licensed as follows. The text is the
+package's own license; the Zstandard library's BSD license has the same three conditions
+and disclaimer (compare the zstd entry in section 1).
+
+Copyright (c) 2016, Gregory Szorc
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+may be used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+==============================================================================
+10. Formats written from their public descriptions  (no third-party code)
+==============================================================================
+CSO / ZSO (including the LZ4 compressor and decompressor, written from the LZ4 block
+format description), PBP, CDI, MDS, NRG and CloneCD readers and writers, and the title
+cards drawn for PBP files were written for this project. LZ4 (https://lz4.org) is by
+Yann Collet. No code from libMirage, mdf2iso, nrg2iso, ccd2iso, cdirip, ciso or
+similar tools was used.

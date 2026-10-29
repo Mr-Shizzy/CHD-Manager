@@ -1,9 +1,10 @@
 <#
-  Builds the portable release:  dist\CHD Manager\  (CHD Manager.exe + chdman.exe + licenses)
+  Builds the portable release:  dist\CHD Manager\  (CHD Manager.exe + chdman.exe + gameInfo.db + licenses)
   and a zip of it:              dist\CHD-Manager-<version>-win64.zip
 
   Needs:  Python 3 with tkinter (tested with 3.12; the python.org install has it) and
-          7-Zip (only to unpack MAME's download).  Nothing else is installed except PyInstaller (via pip).
+          7-Zip (only to unpack MAME's download).  Nothing else is installed except the pip
+          packages PyInstaller and zstandard (zstandard is needed for RVZ and ZSO).
 
   Run from this folder:
       powershell -ExecutionPolicy Bypass -File build.ps1
@@ -25,10 +26,10 @@ Write-Host "Using $pyver"
 & python -c "import tkinter" 2>$null
 if ($LASTEXITCODE -ne 0) { Fail "This Python has no tkinter. Reinstall Python from python.org with the 'tcl/tk' option ticked." }
 
-# ---- 2. PyInstaller
-Write-Host "Installing/updating PyInstaller (pip)..."
-& python -m pip install --quiet --upgrade pyinstaller
-if ($LASTEXITCODE -ne 0) { Fail "Could not install PyInstaller." }
+# ---- 2. PyInstaller and zstandard
+Write-Host "Installing/updating PyInstaller and zstandard (pip)..."
+& python -m pip install --quiet --upgrade pyinstaller zstandard
+if ($LASTEXITCODE -ne 0) { Fail "Could not install PyInstaller and zstandard." }
 
 # ---- 3. chdman
 New-Item -ItemType Directory -Force "$root\build" | Out-Null
@@ -71,6 +72,18 @@ if ($ChdmanPath) {
     }
 }
 
+# ---- 3b. gameInfo.db: the PlayStation game list used to name files (MIT, from the PSXPackager project;
+#          pinned commit, fixed checksum). It goes in the zip, never in git.
+$gameDb = "$root\build\gameInfo.db"
+$dbUrl  = "https://raw.githubusercontent.com/RupertAvery/PSXPackager/453c0e7b11fa46d78fa1939473923699894fde03/Popstation.Database/Resources/gameInfo.db"
+$dbSha  = "fdea8792f8f173e434fd094038e81c14b77db71c00d1c64a11f6ce5b49c4cce9"
+if (-not ((Test-Path $gameDb) -and ((Get-FileHash $gameDb -Algorithm SHA256).Hash.ToLower() -eq $dbSha))) {
+    Write-Host "Downloading gameInfo.db from github.com/RupertAvery/PSXPackager (pinned commit)..."
+    Invoke-WebRequest $dbUrl -OutFile $gameDb -UseBasicParsing
+    if ((Get-FileHash $gameDb -Algorithm SHA256).Hash.ToLower() -ne $dbSha) { Remove-Item $gameDb -Force; Fail "gameInfo.db checksum mismatch - download discarded." }
+    Write-Host "SHA-256 verified."
+}
+
 # ---- 4. exe
 Write-Host "Building the exe..."
 & python -m PyInstaller --noconfirm --clean --onefile --windowed --name "CHD Manager" `
@@ -85,9 +98,11 @@ Remove-Item "$root\dist" -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item "$root\build\exe\CHD Manager.exe" $out
 Copy-Item $chdman "$out\chdman.exe"
+Copy-Item $gameDb "$out\gameInfo.db"
 Copy-Item "$root\LICENSE", "$root\THIRD_PARTY_NOTICES.txt", "$root\README.md", "$root\chdm.cmd" $out
 $zip = "$root\dist\CHD-Manager-$ver-win64.zip"
 Compress-Archive -Path $out -DestinationPath $zip -Force
+
 Write-Host "`nDone." -ForegroundColor Green
 Write-Host "  Folder: $out"
 Write-Host "  Zip:    $zip  (SHA-256 $((Get-FileHash $zip -Algorithm SHA256).Hash))"

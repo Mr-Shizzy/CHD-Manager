@@ -11,3 +11,10 @@ chdman_old/
 # per-user settings
 chd_manager_settings.json
 *.settings.json
+
+# the keys folder is created next to the program when it runs
+keys/
+game_image_toolbox_settings.json
+game_image_toolbox_log.txt
+chd_manager_log.txt
+gameInfo.db
